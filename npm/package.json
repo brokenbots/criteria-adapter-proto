@@ -1,0 +1,16 @@
+{
+  "name": "@criteria/adapter-proto",
+  "version": "0.5.1",
+  "description": "Criteria adapter wire contract (protocol v2) — generated TypeScript bindings (protobuf-es)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": ["dist"],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+  },
+  "scripts": { "build": "tsc" },
+  "dependencies": { "@bufbuild/protobuf": "^2.2.3" },
+  "devDependencies": { "typescript": "^5.6.0" }
+}

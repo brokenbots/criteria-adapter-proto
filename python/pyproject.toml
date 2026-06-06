@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "criteria-adapter-proto"
+version = "0.5.1"
+description = "Criteria adapter wire contract (protocol v2) — generated Python bindings"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["protobuf>=5.0.0", "grpcio>=1.60.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

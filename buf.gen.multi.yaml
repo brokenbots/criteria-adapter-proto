@@ -1,0 +1,12 @@
+# Multi-language bindings for the npm + PyPI packages. Go bindings are committed
+# under criteria/v2 (generated separately); these are generated at publish time.
+version: v2
+plugins:
+  - remote: buf.build/bufbuild/es:v2.2.3
+    out: npm/src
+    opt:
+      - target=ts
+  - remote: buf.build/protocolbuffers/python:v28.3
+    out: python/src
+  - remote: buf.build/grpc/python:v1.67.0
+    out: python/src

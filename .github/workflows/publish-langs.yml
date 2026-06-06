@@ -1,0 +1,69 @@
+name: Publish language packages
+
+# Generates the TypeScript + Python bindings from the .proto sources and
+# publishes the npm (@criteria/adapter-proto) and PyPI (criteria-adapter-proto)
+# packages. Both steps are GATED on credentials: they skip gracefully unless the
+# NPM_TOKEN / PYPI_API_TOKEN repository secrets are set. The Go module needs no
+# publish step — tagging makes it resolvable via the module proxy.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - run: buf generate --template buf.gen.multi.yaml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Build + publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::notice::NPM_TOKEN not set — skipping npm publish (generation + build still verified)"
+          fi
+          cd npm
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
+          fi
+          npm install
+          npm run build
+          if [ -n "${NODE_AUTH_TOKEN}" ]; then
+            npm publish --access public
+          fi
+
+  pypi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - run: buf generate --template buf.gen.multi.yaml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build + publish PyPI package
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "${PYPI_API_TOKEN}" ]; then
+            echo "::notice::PYPI_API_TOKEN not set — skipping PyPI publish (generation + build still verified)"
+          fi
+          cd python
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            sed -i "s/^version = .*/version = \"${GITHUB_REF_NAME#v}\"/" pyproject.toml
+          fi
+          python -m pip install --upgrade build twine
+          python -m build --wheel --sdist
+          if [ -n "${PYPI_API_TOKEN}" ]; then
+            python -m twine upload --username __token__ --password "${PYPI_API_TOKEN}" dist/*
+          fi
