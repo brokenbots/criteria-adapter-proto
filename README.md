@@ -72,3 +72,17 @@ Tagging `vX.Y.Z`:
   **gated on credentials** (`NPM_TOKEN` + the `@criteria` scope; `PYPI_API_TOKEN`):
   until those repository secrets are set, generation + build are still verified
   on each tag but the publish step is skipped.
+
+## Security & dependencies
+
+Supply-chain controls and the dependency-freshness policy are documented in
+[SECURITY.md](SECURITY.md) and [docs/dependency-policy.md](docs/dependency-policy.md).
+CI runs a **blocking** osv-scanner gate over the Go module plus a non-blocking
+freshness report; Dependabot covers all four ecosystems (Go, npm, pip, GitHub
+Actions) with a 7-day cooldown. Reproduce locally:
+
+```bash
+make vuln-scan      # osv-scanner — known-vulnerability gate (WS49)
+make deps-outdated  # go-mod-outdated — freshness report (WS50)
+make deps-majors    # gomajor — available major (/vN) upgrades
+```

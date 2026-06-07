@@ -1,0 +1,54 @@
+version: 2
+
+# Dependency-freshness & supply-chain policy: docs/dependency-policy.md
+#
+# This is a multi-language wire-contract repo: a Go module (/), an npm package
+# (/npm), and a PyPI package (/python). Dependabot covers all three ecosystems
+# plus GitHub Actions, in the routine minor/patch lane. Go majors are module-path
+# (/vN) changes driven by `gomajor` (see `make deps-majors`), which Dependabot
+# cannot perform — majors it raises are SIGNALS, not merge-ready PRs.
+#
+# Every ecosystem carries a 7-day cooldown so a freshly-published (possibly
+# compromised) release is not ingested immediately. Security updates are exempt
+# from the cooldown by Dependabot's design. Majors are not ignored.
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /npm
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /python
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
