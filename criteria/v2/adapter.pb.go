@@ -326,21 +326,34 @@ func (*InfoRequest) Descriptor() ([]byte, []int) {
 }
 
 type InfoResponse struct {
-	state                  protoimpl.MessageState `protogen:"open.v1"`
-	Name                   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Version                string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	Description            string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
-	Capabilities           []string               `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	Platforms              []string               `protobuf:"bytes,5,rep,name=platforms,proto3" json:"platforms,omitempty"`
-	SdkProtocolVersion     string                 `protobuf:"bytes,6,opt,name=sdk_protocol_version,json=sdkProtocolVersion,proto3" json:"sdk_protocol_version,omitempty"`
-	SourceUrl              string                 `protobuf:"bytes,7,opt,name=source_url,json=sourceUrl,proto3" json:"source_url,omitempty"`
-	ConfigSchema           *AdapterSchemaProto    `protobuf:"bytes,8,opt,name=config_schema,json=configSchema,proto3" json:"config_schema,omitempty"`
-	InputSchema            *AdapterSchemaProto    `protobuf:"bytes,9,opt,name=input_schema,json=inputSchema,proto3" json:"input_schema,omitempty"`
-	OutputSchema           *AdapterSchemaProto    `protobuf:"bytes,10,opt,name=output_schema,json=outputSchema,proto3" json:"output_schema,omitempty"`                                             // NEW v2: schema for step outputs
-	Secrets                map[string]string      `protobuf:"bytes,11,rep,name=secrets,proto3" json:"secrets,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // declared secret names → descriptions
-	Permissions            []string               `protobuf:"bytes,12,rep,name=permissions,proto3" json:"permissions,omitempty"`
-	CompatibleEnvironments []string               `protobuf:"bytes,13,rep,name=compatible_environments,json=compatibleEnvironments,proto3" json:"compatible_environments,omitempty"`
-	ContainerImage         string                 `protobuf:"bytes,14,opt,name=container_image,json=containerImage,proto3" json:"container_image,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Name        string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Version     string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	Description string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
+	// capabilities is a free-form vocabulary of well-known capability strings
+	// the adapter declares at the Info handshake so the host can gate behavior
+	// on them; unknown values are ignored for forward-compatibility.
+	// Well-known values:
+	//
+	//	parallel_safe — Execute is safe to run concurrently with other steps.
+	//	adapter_tools — the adapter speaks the tool-call flow: it emits
+	//	                permission.request AdapterEvents with payload kind
+	//	                "adapter_tool" and consumes PermissionEvent
+	//	                .tool_call_result answers (see PermissionEvent).
+	//	                The host gates per-call, not at session open: a
+	//	                tool_call from an adapter that never declared this is
+	//	                answered with the typed call_error capability_missing.
+	Capabilities           []string            `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	Platforms              []string            `protobuf:"bytes,5,rep,name=platforms,proto3" json:"platforms,omitempty"`
+	SdkProtocolVersion     string              `protobuf:"bytes,6,opt,name=sdk_protocol_version,json=sdkProtocolVersion,proto3" json:"sdk_protocol_version,omitempty"`
+	SourceUrl              string              `protobuf:"bytes,7,opt,name=source_url,json=sourceUrl,proto3" json:"source_url,omitempty"`
+	ConfigSchema           *AdapterSchemaProto `protobuf:"bytes,8,opt,name=config_schema,json=configSchema,proto3" json:"config_schema,omitempty"`
+	InputSchema            *AdapterSchemaProto `protobuf:"bytes,9,opt,name=input_schema,json=inputSchema,proto3" json:"input_schema,omitempty"`
+	OutputSchema           *AdapterSchemaProto `protobuf:"bytes,10,opt,name=output_schema,json=outputSchema,proto3" json:"output_schema,omitempty"`                                             // NEW v2: schema for step outputs
+	Secrets                map[string]string   `protobuf:"bytes,11,rep,name=secrets,proto3" json:"secrets,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // declared secret names → descriptions
+	Permissions            []string            `protobuf:"bytes,12,rep,name=permissions,proto3" json:"permissions,omitempty"`
+	CompatibleEnvironments []string            `protobuf:"bytes,13,rep,name=compatible_environments,json=compatibleEnvironments,proto3" json:"compatible_environments,omitempty"`
+	ContainerImage         string              `protobuf:"bytes,14,opt,name=container_image,json=containerImage,proto3" json:"container_image,omitempty"`
 	// supported_features lists optional capabilities this adapter implements.
 	// Well-known values: "pause", "resume", "snapshot", "restore", "inspect".
 	// The host gates UI and behavior on this list; unknown values are ignored
@@ -1539,8 +1552,9 @@ func (x *ToolCallResult) GetCallError() string {
 // tool_call_result; a denied call is answered with cancel. A granted call
 // answered only by a bare request with no subsequent tool_call_result means
 // the host predates adapter tools: callers surface that as the typed
-// host_unsupported failure. Hosts advertise support with the "adapter_tools"
-// capability string in InfoResponse.capabilities.
+// host_unsupported failure. Adapters advertise tool-call support with the
+// "adapter_tools" capability string in InfoResponse.capabilities; the host
+// gates per-call on that declaration (see InfoResponse.capabilities).
 type PermissionEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Event:

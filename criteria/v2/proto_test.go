@@ -80,6 +80,36 @@ func TestInfoResponse_SupportedFeatures_ForwardCompat(t *testing.T) {
 	require.Equal(t, msg.SupportedFeatures, got.SupportedFeatures)
 }
 
+// TestInfoResponse_Capabilities_AdapterTools_RoundTrip asserts the CRI-153
+// capability vocabulary: adapters declare tool-call support with the
+// "adapter_tools" capability string in InfoResponse.capabilities, and the
+// string must survive the wire round-trip — both alongside the other
+// well-known values and on its own. Unknown capability strings are free-form
+// vocabulary, not enum values, so they round-trip unchanged too.
+func TestInfoResponse_Capabilities_AdapterTools_RoundTrip(t *testing.T) {
+	msg := &criteriav2.InfoResponse{
+		Name:         "test-adapter",
+		Version:      "1.0.0",
+		Capabilities: []string{"parallel_safe", "adapter_tools"},
+	}
+	got := roundTrip(t, msg)
+	require.True(t, proto.Equal(msg, got))
+	assert.Equal(t, []string{"parallel_safe", "adapter_tools"}, got.Capabilities,
+		"well-known capability values must survive the InfoResponse round-trip")
+	assert.Contains(t, got.Capabilities, "adapter_tools",
+		"the adapter_tools capability string must round-trip through InfoResponse")
+
+	solo := &criteriav2.InfoResponse{Capabilities: []string{"adapter_tools"}}
+	gotSolo := roundTrip(t, solo)
+	require.True(t, proto.Equal(solo, gotSolo))
+	assert.Equal(t, []string{"adapter_tools"}, gotSolo.Capabilities)
+
+	future := &criteriav2.InfoResponse{Capabilities: []string{"some_future_capability_xyz"}}
+	gotFuture := roundTrip(t, future)
+	require.Equal(t, []string{"some_future_capability_xyz"}, gotFuture.Capabilities,
+		"unknown capability values are free-form and must round-trip unchanged")
+}
+
 // ─── OpenSession ─────────────────────────────────────────────────────────────
 
 func TestOpenSessionRequest_RoundTrip(t *testing.T) {
