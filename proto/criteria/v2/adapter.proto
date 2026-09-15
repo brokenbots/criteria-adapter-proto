@@ -99,6 +99,19 @@ message InfoResponse {
   string name = 1;
   string version = 2;
   string description = 3;
+  // capabilities is a free-form vocabulary of well-known capability strings
+  // the adapter declares at the Info handshake so the host can gate behavior
+  // on them; unknown values are ignored for forward-compatibility.
+  // Well-known values:
+  //
+  //   parallel_safe — Execute is safe to run concurrently with other steps.
+  //   adapter_tools — the adapter speaks the tool-call flow: it emits
+  //                   permission.request AdapterEvents with payload kind
+  //                   "adapter_tool" and consumes PermissionEvent
+  //                   .tool_call_result answers (see PermissionEvent).
+  //                   The host gates per-call, not at session open: a
+  //                   tool_call from an adapter that never declared this is
+  //                   answered with the typed call_error capability_missing.
   repeated string capabilities = 4;
   repeated string platforms = 5;
   string sdk_protocol_version = 6;
@@ -379,8 +392,9 @@ message ToolCallResult {
 // tool_call_result; a denied call is answered with cancel. A granted call
 // answered only by a bare request with no subsequent tool_call_result means
 // the host predates adapter tools: callers surface that as the typed
-// host_unsupported failure. Hosts advertise support with the "adapter_tools"
-// capability string in InfoResponse.capabilities.
+// host_unsupported failure. Adapters advertise tool-call support with the
+// "adapter_tools" capability string in InfoResponse.capabilities; the host
+// gates per-call on that declaration (see InfoResponse.capabilities).
 message PermissionEvent {
   oneof event {
     PermissionRequest request = 1;
