@@ -132,6 +132,33 @@ message InfoResponse {
   // message field before requiring chunked framing.  0 = use default (4 MiB).
   // The host uses min(host_max, adapter_max) when chunking outbound payloads.
   uint32 max_chunk_bytes = 16; // NEW v2 (D78)
+  // tools advertises the tools the adapter offers, so the host and compiler
+  // can discover them without a second mechanism.  Dynamic-tools adapters
+  // (mcp, CRI-172) populate it from tools/list at OpenSession; static-tools
+  // adapters MAY populate it too.  When present, the compiler consumes this
+  // list for the static tool-name check (CRI-173 upgrade path) — this field
+  // must land on the wire BEFORE the compiler starts consuming it.  Absent
+  // = the compiler has no advertised list and falls back to its static
+  // configuration.
+  //
+  // InfoResponse is sent at every handshake (and re-verification), so a
+  // large tools list is acceptable but adapters should keep descriptions
+  // short — the list multiplies across every handshake.
+  repeated ToolInfo tools = 17; // NEW v2 (CRI-171)
+  reserved 100 to 999;
+}
+
+// ToolInfo describes a single tool in InfoResponse.tools: its wire name,
+// a short human-readable description, and (optionally) a JSON-schema sketch
+// of its arguments.
+message ToolInfo {
+  string name = 1;
+  string description = 2;
+  // args_schema_json is a JSON-schema sketch of the tool's arguments.  It is
+  // a sketch only — a hint for callers and the compiler — NOT a second
+  // schema system; do not build validation on it.  Empty/unset when the
+  // tool takes no arguments or the adapter does not know the shape.
+  optional string args_schema_json = 3;
   reserved 100 to 999;
 }
 

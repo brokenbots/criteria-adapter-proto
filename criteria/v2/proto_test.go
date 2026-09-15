@@ -66,6 +66,9 @@ func TestInfoResponse_RoundTrip(t *testing.T) {
 		ContainerImage:         "ghcr.io/example/adapter:latest",
 		SupportedFeatures:      []string{"pause", "snapshot"},
 		MaxChunkBytes:          1024 * 1024,
+		Tools: []*criteriav2.ToolInfo{
+			{Name: "search", Description: "Search the web"},
+		},
 	}
 	got := roundTrip(t, msg)
 	assert.True(t, proto.Equal(msg, got))
@@ -78,6 +81,79 @@ func TestInfoResponse_SupportedFeatures_ForwardCompat(t *testing.T) {
 	}
 	got := roundTrip(t, msg)
 	require.Equal(t, msg.SupportedFeatures, got.SupportedFeatures)
+}
+
+// TestInfoResponse_Tools_RoundTrip asserts the CRI-171 dynamic tool discovery
+// contract: InfoResponse.tools carries ToolInfo entries (name, description,
+// optional args_schema_json) and they survive the proto wire round-trip
+// unchanged.  Dynamic-tools adapters (mcp, CRI-172) populate the list from
+// tools/list at OpenSession; static-tools adapters MAY populate it, and the
+// compiler consumes it when present for the static name check (CRI-173
+// upgrade path) — so the wire shape must be stable.
+func TestInfoResponse_Tools_RoundTrip(t *testing.T) {
+	const searchSchema = `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`
+	msg := &criteriav2.InfoResponse{
+		Name:    "mcp-adapter",
+		Version: "1.0.0",
+		Tools: []*criteriav2.ToolInfo{
+			{
+				Name:           "search",
+				Description:    "Search the web",
+				ArgsSchemaJson: proto.String(searchSchema),
+			},
+			{
+				Name:        "ping",
+				Description: "No-argument tool",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	require.True(t, proto.Equal(msg, got))
+	require.Len(t, got.Tools, 2, "both advertised tools must survive the wire")
+
+	first := got.Tools[0]
+	assert.Equal(t, "search", first.Name)
+	assert.Equal(t, "Search the web", first.Description)
+	require.NotNil(t, first.ArgsSchemaJson)
+	assert.Equal(t, searchSchema, *first.ArgsSchemaJson,
+		"args_schema_json is a JSON-schema sketch and must round-trip byte-faithfully")
+
+	second := got.Tools[1]
+	assert.Equal(t, "ping", second.Name)
+	assert.Equal(t, "No-argument tool", second.Description)
+	assert.Nil(t, second.ArgsSchemaJson,
+		"args_schema_json is optional; absent must stay absent across the wire")
+}
+
+// TestInfoResponse_Tools_WireFieldNumbers pins the CRI-171 wire contract:
+// InfoResponse.tools is field 17 (immediately after max_chunk_bytes=16), and
+// ToolInfo carries name(1), description(2), args_schema_json(3).  The field
+// must land on the wire BEFORE the compiler consumes the advertised list for
+// the CRI-173 static name check, so these numbers are part of the contract.
+func TestInfoResponse_Tools_WireFieldNumbers(t *testing.T) {
+	fd := criteriav2.File_criteria_v2_adapter_proto
+	require.NotNil(t, fd, "adapter proto descriptor must be registered")
+
+	infoDesc := fd.Messages().ByName("InfoResponse")
+	require.NotNil(t, infoDesc)
+	tools := infoDesc.Fields().ByName("tools")
+	require.NotNil(t, tools, "InfoResponse.tools must exist on the wire")
+	assert.Equal(t, protoreflect.FieldNumber(17), tools.Number(), "InfoResponse.tools must be field 17")
+	assert.True(t, tools.IsList(), "InfoResponse.tools must be a repeated field")
+	maxChunk := infoDesc.Fields().ByName("max_chunk_bytes")
+	require.NotNil(t, maxChunk)
+	assert.Equal(t, protoreflect.FieldNumber(16), maxChunk.Number(),
+		"tools must be next free field after max_chunk_bytes")
+
+	toolInfoDesc := fd.Messages().ByName("ToolInfo")
+	require.NotNil(t, toolInfoDesc)
+	assert.Equal(t, protoreflect.FieldNumber(1), toolInfoDesc.Fields().ByName("name").Number())
+	assert.Equal(t, protoreflect.FieldNumber(2), toolInfoDesc.Fields().ByName("description").Number())
+	schema := toolInfoDesc.Fields().ByName("args_schema_json")
+	require.NotNil(t, schema)
+	assert.Equal(t, protoreflect.FieldNumber(3), schema.Number())
+	assert.True(t, schema.HasPresence(),
+		"args_schema_json must be explicitly optional (presence-tracking)")
 }
 
 // TestInfoResponse_Capabilities_AdapterTools_RoundTrip asserts the CRI-153
@@ -907,51 +983,20 @@ func TestReservedFields_PermissionRequest(t *testing.T) {
 // in every message defined in adapter.proto.  Adding a field in this range
 // would break the protocol versioning guarantee (WS02 exit criterion).
 func TestReservedFields_100To999Block(t *testing.T) {
-	// All messages in criteria/v2/adapter.proto must reserve 100 to 999.
-	msgNames := []protoreflect.Name{
-		"Chunk",
-		"Heartbeat",
-		"ConfigFieldProto",
-		"AdapterSchemaProto",
-		"InfoRequest",
-		"InfoResponse",
-		"OpenSessionRequest",
-		"OpenSessionResponse",
-		"CloseSessionRequest",
-		"CloseSessionResponse",
-		"ExecuteRequest",
-		"AdapterEvent",
-		"ToolInvocation",
-		"ExecuteResult",
-		"ExecuteEvent",
-		"LogRequest",
-		"LogEvent",
-		"PermissionRequest",
-		"PermissionCancel",
-		"PermissionEvent",
-		"ToolCallResult",
-		"PermissionDecision",
-		"PauseRequest",
-		"PauseResponse",
-		"ResumeRequest",
-		"ResumeResponse",
-		"SnapshotRequest",
-		"SnapshotResponse",
-		"RestoreRequest",
-		"RestoreResponse",
-		"SnapshotVersionMismatch",
-		"InspectRequest",
-		"InspectField",
-		"InspectResponse",
-	}
-	for _, name := range msgNames {
+	// Every message in criteria/v2/adapter.proto must reserve 100 to 999.
+	// The message set is derived from the compiled descriptor rather than a
+	// hand-maintained list, so a newly added message cannot silently skip
+	// this check.
+	msgs := criteriav2.File_criteria_v2_adapter_proto.Messages()
+	require.Positive(t, msgs.Len(), "adapter.proto must define messages")
+	for i := 0; i < msgs.Len(); i++ {
+		msgDesc := msgs.Get(i)
+		name := msgDesc.FullName().Name()
 		t.Run(string(name), func(t *testing.T) {
-			msgDesc := criteriav2.File_criteria_v2_adapter_proto.Messages().ByName(name)
-			require.NotNilf(t, msgDesc, "message %s not found in adapter.proto", name)
 			found := false
 			ranges := msgDesc.ReservedRanges()
-			for i := 0; i < ranges.Len(); i++ {
-				r := ranges.Get(i)
+			for j := 0; j < ranges.Len(); j++ {
+				r := ranges.Get(j)
 				if r[0] <= 100 && int(r[1]) > 999 {
 					found = true
 				}
