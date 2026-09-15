@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	criteriav2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
 )
@@ -209,4 +210,128 @@ func TestArgsDigest_MatchesCanonicalJSONSHA256(t *testing.T) {
 func TestCanonicalJSON_UnsupportedTypeErrors(t *testing.T) {
 	_, err := criteriav2.CanonicalJSON(map[string]any{"ch": make(chan int)})
 	assert.Error(t, err)
+}
+
+// TestArgsDigest_ToolCallParityWithPermissionRequest pins the CRI-154
+// args_digest parity contract across the two wire surfaces that carry a
+// tool call's digest:
+//
+//   - PermissionRequest.args_digest on the Permissions stream (the host
+//     asks the adapter to approve the call), and
+//   - the "args_digest" key of the permission.request AdapterEvent payload
+//     with kind "adapter_tool" on the Execute stream (the SDK reports the
+//     call to the host for permission evaluation).
+//
+// Both surfaces must hold the same sha256(canonical_json(args)) value,
+// computed by the exported helper criteriav2.ArgsDigest, so that host-side
+// correlation and audit compare equal no matter which surface a consumer
+// observes, and recomputing the digest from the reported args reproduces it.
+//
+// Vector source: the canonical bytes below are hand-pinned shared vectors in
+// the host's canonical-JSON dialect (byte-wise key sort, no whitespace,
+// encoding/json string escaping — the same dialect pinned by
+// TestCanonicalJSON above); each digest is sha256 over exactly those bytes,
+// matching the engine's implementation (internal/adapter/audit/canonical.go,
+// cross-checked side by side per the file-comment methodology above).
+func TestArgsDigest_ToolCallParityWithPermissionRequest(t *testing.T) {
+	const tool = "create_issue"
+	vectors := []struct {
+		name       string
+		argsJSON   string // raw JSON of the call args, as the calling adapter holds them
+		wantCanon  string // pinned canonical JSON, shared with the host
+		wantDigest string // pinned sha256(canonical JSON), shared with the host
+	}{
+		{
+			name:       "flat args, key order differs from canonical",
+			argsJSON:   `{"title":"Found a bug","labels":["bug","help wanted"]}`,
+			wantCanon:  `{"labels":["bug","help wanted"],"title":"Found a bug"}`,
+			wantDigest: "1ad0cfd63d392e1498cc20c961665b51f9595916fa6f74d6fc201eeeae1d34e9",
+		},
+		{
+			name:       "nested args, nested key order differs too",
+			argsJSON:   `{"draft":false,"repo":"hello-world","owner":"octocat","config":{"timeout_ms":1500.5,"retries":3}}`,
+			wantCanon:  `{"config":{"retries":3,"timeout_ms":1500.5},"draft":false,"owner":"octocat","repo":"hello-world"}`,
+			wantDigest: "fc795b0731cf8ee1c9b55c4cf19d7c320e7066d92043804b9df3f192f8a4af0d",
+		},
+		{
+			name:       "args containing HTML-escapable characters",
+			argsJSON:   `{"body":"a<b>&c"}`,
+			wantCanon:  `{"body":"a\u003cb\u003e\u0026c"}`,
+			wantDigest: "4299b4663303acff818fd993e0cabd98949de46231b7de58fa5808087ba2834a",
+		},
+		{
+			name:       "empty args object",
+			argsJSON:   `{}`,
+			wantCanon:  `{}`,
+			wantDigest: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+		},
+	}
+	for _, tc := range vectors {
+		t.Run(tc.name, func(t *testing.T) {
+			var args any
+			require.NoError(t, json.Unmarshal([]byte(tc.argsJSON), &args))
+
+			// The exported helper (CRI-152) produces exactly the pinned
+			// canonical bytes and their digest.
+			canon, err := criteriav2.CanonicalJSON(args)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantCanon, string(canon), "canonical bytes must match the shared vector")
+			digest, err := criteriav2.ArgsDigest(args)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantDigest, digest, "args_digest must match the shared vector")
+
+			// The digest is exactly sha256 over the canonical bytes — the
+			// documented formula, not some other serialisation.
+			sum := sha256.Sum256([]byte(tc.wantCanon))
+			assert.Equal(t, hex.EncodeToString(sum[:]), digest)
+
+			// Wire parity: the SAME digest string rides both surfaces.
+			//
+			// Permissions stream, adapter→host:
+			req := &criteriav2.PermissionRequest{
+				RequestId:  "req-parity-1",
+				Tool:       tool,
+				ArgsDigest: digest,
+			}
+			reqBytes, err := proto.Marshal(req)
+			require.NoError(t, err)
+			var onPermissions criteriav2.PermissionRequest
+			require.NoError(t, proto.Unmarshal(reqBytes, &onPermissions))
+
+			// Execute stream, permission.request AdapterEvent payload
+			// (kind "adapter_tool"), in its documented map form.
+			payload := map[string]any{
+				"kind":        "adapter_tool",
+				"request_id":  req.RequestId,
+				"target":      "adapter.github.octocat.tools." + tool,
+				"tool":        tool,
+				"args":        args,
+				"args_digest": digest,
+			}
+			payloadJSON, err := json.Marshal(payload)
+			require.NoError(t, err)
+			var onExecute map[string]any
+			require.NoError(t, json.Unmarshal(payloadJSON, &onExecute))
+
+			assert.Equal(t, onPermissions.GetArgsDigest(), onExecute["args_digest"],
+				"PermissionRequest.args_digest and the adapter_tool payload args_digest must be the same digest")
+
+			// Recomputing the digest from the payload's args (serialized in
+			// whatever key order json.Marshal chose) reproduces the wire
+			// digest: canonicalisation makes correlation order-insensitive.
+			recomputed, err := criteriav2.ArgsDigest(onExecute["args"])
+			require.NoError(t, err)
+			assert.Equal(t, onPermissions.GetArgsDigest(), recomputed,
+				"digest recomputed from the payload args must match the wire digest")
+		})
+	}
+
+	// Serialisation-order independence on the args themselves: two adapters
+	// holding the same args in different map orders digest identically, so
+	// parity never depends on insertion order.
+	d1, err := criteriav2.ArgsDigest(map[string]any{"title": "T", "body": "B", "labels": []any{"bug", "p1"}, "draft": false})
+	require.NoError(t, err)
+	d2, err := criteriav2.ArgsDigest(map[string]any{"draft": false, "labels": []any{"bug", "p1"}, "body": "B", "title": "T"})
+	require.NoError(t, err)
+	assert.Equal(t, d1, d2, "same args in different map orders must digest identically")
 }
