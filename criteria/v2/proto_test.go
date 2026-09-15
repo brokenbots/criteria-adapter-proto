@@ -983,51 +983,20 @@ func TestReservedFields_PermissionRequest(t *testing.T) {
 // in every message defined in adapter.proto.  Adding a field in this range
 // would break the protocol versioning guarantee (WS02 exit criterion).
 func TestReservedFields_100To999Block(t *testing.T) {
-	// All messages in criteria/v2/adapter.proto must reserve 100 to 999.
-	msgNames := []protoreflect.Name{
-		"Chunk",
-		"Heartbeat",
-		"ConfigFieldProto",
-		"AdapterSchemaProto",
-		"InfoRequest",
-		"InfoResponse",
-		"OpenSessionRequest",
-		"OpenSessionResponse",
-		"CloseSessionRequest",
-		"CloseSessionResponse",
-		"ExecuteRequest",
-		"AdapterEvent",
-		"ToolInvocation",
-		"ExecuteResult",
-		"ExecuteEvent",
-		"LogRequest",
-		"LogEvent",
-		"PermissionRequest",
-		"PermissionCancel",
-		"PermissionEvent",
-		"ToolCallResult",
-		"PermissionDecision",
-		"PauseRequest",
-		"PauseResponse",
-		"ResumeRequest",
-		"ResumeResponse",
-		"SnapshotRequest",
-		"SnapshotResponse",
-		"RestoreRequest",
-		"RestoreResponse",
-		"SnapshotVersionMismatch",
-		"InspectRequest",
-		"InspectField",
-		"InspectResponse",
-	}
-	for _, name := range msgNames {
+	// Every message in criteria/v2/adapter.proto must reserve 100 to 999.
+	// The message set is derived from the compiled descriptor rather than a
+	// hand-maintained list, so a newly added message cannot silently skip
+	// this check.
+	msgs := criteriav2.File_criteria_v2_adapter_proto.Messages()
+	require.Positive(t, msgs.Len(), "adapter.proto must define messages")
+	for i := 0; i < msgs.Len(); i++ {
+		msgDesc := msgs.Get(i)
+		name := msgDesc.FullName().Name()
 		t.Run(string(name), func(t *testing.T) {
-			msgDesc := criteriav2.File_criteria_v2_adapter_proto.Messages().ByName(name)
-			require.NotNilf(t, msgDesc, "message %s not found in adapter.proto", name)
 			found := false
 			ranges := msgDesc.ReservedRanges()
-			for i := 0; i < ranges.Len(); i++ {
-				r := ranges.Get(i)
+			for j := 0; j < ranges.Len(); j++ {
+				r := ranges.Get(j)
 				if r[0] <= 100 && int(r[1]) > 999 {
 					found = true
 				}
