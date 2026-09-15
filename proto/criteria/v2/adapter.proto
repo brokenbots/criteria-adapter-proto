@@ -6,8 +6,10 @@
 // against v1 must be recompiled against these bindings.
 //
 // The Permissions RPC is a bidirectional stream: the HOST (gRPC client) sends
-// PermissionEvent messages (request=allow, cancel=deny) and the ADAPTER (gRPC
-// server) sends PermissionDecision acknowledgments back. Adapters that embed
+// PermissionEvent messages (request=allow-grant, cancel=deny, and — for
+// adapter tool calls — tool_call_result=the callee's completed result) and
+// the ADAPTER (gRPC server) sends PermissionDecision acknowledgments back.
+// Adapters that embed
 // sdk/adapterhost.UnimplementedPermissions receive post-hoc enforcement
 // (outcome override to needs_review on denial); adapters that implement
 // Permissions themselves (e.g. copilot) get blocking enforcement so the tool
@@ -165,6 +167,13 @@ message ExecuteRequest {
 // event_kind is a dot-separated identifier; well-known values are registered
 // in docs/adapters.md (WS39).  Unknown kinds are forwarded unchanged.
 //
+// Well-known event_kind "permission.request" is a blocking permission or
+// adapter-tool-call request: the adapter emits it on the Execute stream and
+// blocks until the host answers on the Permissions stream.  For adapter tool
+// calls (payload kind "adapter_tool") the completed result returns as
+// PermissionEvent.tool_call_result, correlated by request_id — see
+// PermissionEvent for the full payload contract.
+//
 // Chunked encoding: when chunk is non-nil, payload is nil and payload_json
 // carries the raw JSON bytes of this fragment.  Reassemble payload_json bytes
 // in Chunk.seq order and unmarshal the result to google.protobuf.Struct.
@@ -249,8 +258,10 @@ message LogEvent {
 // ─── Permissions ─────────────────────────────────────────────────────────────
 
 // PermissionRequest is sent by the adapter to request permission for a tool call.
-// args_digest = sha256(canonical_json(args)) per the JCS / RFC 8785 algorithm
-// (see internal/adapter/audit/canonical.go).
+// args_digest = sha256(canonical_json(args)), computed with the canonical-JSON
+// helper exposed by this module (criteriav2.ArgsDigest in the Go bindings) so
+// the host and every SDK digest args to identical bytes — see that helper for
+// the exact algorithm contract.
 message PermissionRequest {
   string request_id = 1;
   string tool = 2;
@@ -268,17 +279,113 @@ message PermissionRequest {
 // PermissionEvent with cancel set; the adapter unblocks the pending request
 // and returns Denied to the Copilot SDK so the tool does not run.
 // reason is optional human-readable text (e.g. "no matching allow_tools entry").
+//
+// For adapter tool calls, cancel is the deny path: the tool call is refused
+// (the callee is never invoked) and the calling adapter treats cancel as the
+// denial of the correlated call. A *typed failure of an issued call* is
+// delivered as ToolCallResult.call_error instead — never as cancel — so the
+// SDK can distinguish "not allowed" from "failed".
 message PermissionCancel {
   string request_id = 1;
   string reason = 2;
   reserved 100 to 999;
 }
 
-// PermissionEvent is the client-to-server message on the Permissions stream.
+// ToolCallResult returns the callee's completed result of an adapter tool
+// call from the HOST to the ADAPTER on the Permissions stream. It is carried
+// in PermissionEvent.tool_call_result and correlated with the caller's
+// `permission.request` AdapterEvent payload (kind "adapter_tool", documented
+// on PermissionEvent) by request_id.
+//
+// Exactly one of the two result shapes is present:
+//
+//   - success: outcome is set to the callee's ExecuteResult outcome and
+//     outputs_json carries the callee's typed outputs (nil when the callee
+//     emitted none). The callee's outcome is data on the result — it is not
+//     an FSM outcome; the callee never enters the state machine.
+//   - typed failure: call_error is non-empty. outcome and outputs_json are
+//     then meaningless and must be ignored.
+//
+// A denied call never arrives as ToolCallResult: it is delivered as
+// PermissionEvent.cancel, so SDKs can distinguish "the tool call was not
+// allowed" from "the tool call failed" (call_error) and from "the tool call
+// succeeded" (outcome).
+//
+// outputs_json reuses the ExecuteResult.outputs_json chunking contract
+// verbatim: when chunk is non-nil, collect all fragments in Chunk.seq order,
+// concatenate, then decode; when chunk is nil, outputs_json is the whole
+// object in one message.
+message ToolCallResult {
+  string request_id = 1; // correlates with the caller's permission.request payload
+  // outcome is the callee's ExecuteResult outcome; meaningless when
+  // call_error is set.
+  string outcome = 2;
+  // chunk is non-nil when outputs_json is a fragment.
+  Chunk chunk = 3;
+  // outputs_json is the JSON-encoded bytes of the callee's outputs object,
+  // with the same native-JSON-type encoding as ExecuteResult.outputs_json.
+  // When chunk is non-nil, collect all fragments in Chunk.seq order,
+  // concatenate, then decode; when chunk is nil, outputs_json is the whole
+  // object in one message.
+  bytes outputs_json = 4;
+  // call_error carries a well-known typed host-side failure for the tool
+  // call; non-empty means typed failure (outcome and outputs_json are then
+  // meaningless). It is a free-form registry, not an enum: unknown values
+  // must round-trip unchanged. Well-known values:
+  //
+  //   unknown_adapter    — the target names no declared adapter instance
+  //   unknown_tool       — the callee presents no such tool
+  //   capability_missing — the callee presents no tool surface for the call
+  //   host_unsupported   — the host predates adapter tools (a granted call
+  //                        came back as a bare allow-grant with no result)
+  //   depth_exceeded     — the tool-call stack exceeded policy.max_tool_depth
+  //   cycle_detected     — runtime cycle detection fired on the call graph
+  //   callee_crash       — the callee's Execute failed before returning a result
+  //   callee_timeout     — the callee did not answer within its deadline
+  //   canceled           — the call was abandoned (run canceled) while in flight
+  //   not_yet_supported  — a planned behavior is not implemented yet
+  //                        (e.g. pause/resume while a call is in flight)
+  //   self_call          — the callee is the calling adapter's own instance
+  string call_error = 5;
+  reserved 100 to 999;
+}
+
+// PermissionEvent is the host-to-adapter message on the Permissions stream.
+// It is how the host answers a blocking `permission.request` AdapterEvent
+// (emitted by the adapter on the Execute stream), correlated by request_id:
+//
+//   - request: allow-grant. The adapter may proceed with the permitted call.
+//   - cancel: deny. Callers treat cancel as the deny of the correlated
+//     request; the call never runs.
+//   - tool_call_result: the completed result of an adapter tool call
+//     (success or typed failure) — see ToolCallResult. Results NEVER ride
+//     PermissionDecision; see that message's comment for why.
+//
+// Adapter tool-call request payload — the call itself needs no new message;
+// it rides the existing `permission.request` AdapterEvent on the Execute
+// stream, in map form:
+//
+//	{
+//	  "kind":         "adapter_tool", // distinguishes tool calls from other permission requests
+//	  "request_id":   "<minted by the calling adapter>",
+//	  "target":       "adapter.<type>.<name>.tools[.<tool>]", // full target string
+//	  "tool":         "<tool>", // the tool name only (no adapter prefix)
+//	  "args":         { ... }, // JSON object of call arguments
+//	  "args_digest":  "<sha256(canonical_json(args))>", // see criteriav2.ArgsDigest
+//	  "args_preview": "<optional short printable preview of args>"
+//	}
+//
+// A granted call is answered with request (allow-grant) followed by
+// tool_call_result; a denied call is answered with cancel. A granted call
+// answered only by a bare request with no subsequent tool_call_result means
+// the host predates adapter tools: callers surface that as the typed
+// host_unsupported failure. Hosts advertise support with the "adapter_tools"
+// capability string in InfoResponse.capabilities.
 message PermissionEvent {
   oneof event {
     PermissionRequest request = 1;
     PermissionCancel cancel = 2;
+    ToolCallResult tool_call_result = 3;
   }
   reserved 100 to 999;
 }
@@ -286,6 +393,13 @@ message PermissionEvent {
 // PermissionDecision is the server-to-client message on the Permissions stream.
 // The host answers requests in any order; multiple requests may be in flight.
 // heartbeat is non-nil when this message is a liveness ping with no decision.
+//
+// PermissionDecision is strictly an ACK channel: it carries only
+// allow/deny acknowledgments and liveness pings. Tool-call results NEVER ride
+// it — the host drains and discards PermissionDecision messages, so anything
+// sent here would flow into the drain and never reach the caller. Results
+// travel on PermissionEvent (tool_call_result) in the host-to-adapter
+// direction instead.
 message PermissionDecision {
   string request_id = 1;
   string decision = 2; // "allow" | "deny"

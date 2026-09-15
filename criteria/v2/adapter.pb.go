@@ -6,8 +6,10 @@
 // against v1 must be recompiled against these bindings.
 //
 // The Permissions RPC is a bidirectional stream: the HOST (gRPC client) sends
-// PermissionEvent messages (request=allow, cancel=deny) and the ADAPTER (gRPC
-// server) sends PermissionDecision acknowledgments back. Adapters that embed
+// PermissionEvent messages (request=allow-grant, cancel=deny, and — for
+// adapter tool calls — tool_call_result=the callee's completed result) and
+// the ADAPTER (gRPC server) sends PermissionDecision acknowledgments back.
+// Adapters that embed
 // sdk/adapterhost.UnimplementedPermissions receive post-hoc enforcement
 // (outcome override to needs_review on denial); adapters that implement
 // Permissions themselves (e.g. copilot) get blocking enforcement so the tool
@@ -760,6 +762,13 @@ func (x *ExecuteRequest) GetAllowedOutcomes() []string {
 // event_kind is a dot-separated identifier; well-known values are registered
 // in docs/adapters.md (WS39).  Unknown kinds are forwarded unchanged.
 //
+// Well-known event_kind "permission.request" is a blocking permission or
+// adapter-tool-call request: the adapter emits it on the Execute stream and
+// blocks until the host answers on the Permissions stream.  For adapter tool
+// calls (payload kind "adapter_tool") the completed result returns as
+// PermissionEvent.tool_call_result, correlated by request_id — see
+// PermissionEvent for the full payload contract.
+//
 // Chunked encoding: when chunk is non-nil, payload is nil and payload_json
 // carries the raw JSON bytes of this fragment.  Reassemble payload_json bytes
 // in Chunk.seq order and unmarshal the result to google.protobuf.Struct.
@@ -1240,8 +1249,10 @@ func (x *LogEvent) GetChunk() *Chunk {
 }
 
 // PermissionRequest is sent by the adapter to request permission for a tool call.
-// args_digest = sha256(canonical_json(args)) per the JCS / RFC 8785 algorithm
-// (see internal/adapter/audit/canonical.go).
+// args_digest = sha256(canonical_json(args)), computed with the canonical-JSON
+// helper exposed by this module (criteriav2.ArgsDigest in the Go bindings) so
+// the host and every SDK digest args to identical bytes — see that helper for
+// the exact algorithm contract.
 type PermissionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -1315,6 +1326,12 @@ func (x *PermissionRequest) GetArgsPreview() string {
 // PermissionEvent with cancel set; the adapter unblocks the pending request
 // and returns Denied to the Copilot SDK so the tool does not run.
 // reason is optional human-readable text (e.g. "no matching allow_tools entry").
+//
+// For adapter tool calls, cancel is the deny path: the tool call is refused
+// (the callee is never invoked) and the calling adapter treats cancel as the
+// denial of the correlated call. A *typed failure of an issued call* is
+// delivered as ToolCallResult.call_error instead — never as cancel — so the
+// SDK can distinguish "not allowed" from "failed".
 type PermissionCancel struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -1367,13 +1384,170 @@ func (x *PermissionCancel) GetReason() string {
 	return ""
 }
 
-// PermissionEvent is the client-to-server message on the Permissions stream.
+// ToolCallResult returns the callee's completed result of an adapter tool
+// call from the HOST to the ADAPTER on the Permissions stream. It is carried
+// in PermissionEvent.tool_call_result and correlated with the caller's
+// `permission.request` AdapterEvent payload (kind "adapter_tool", documented
+// on PermissionEvent) by request_id.
+//
+// Exactly one of the two result shapes is present:
+//
+//   - success: outcome is set to the callee's ExecuteResult outcome and
+//     outputs_json carries the callee's typed outputs (nil when the callee
+//     emitted none). The callee's outcome is data on the result — it is not
+//     an FSM outcome; the callee never enters the state machine.
+//   - typed failure: call_error is non-empty. outcome and outputs_json are
+//     then meaningless and must be ignored.
+//
+// A denied call never arrives as ToolCallResult: it is delivered as
+// PermissionEvent.cancel, so SDKs can distinguish "the tool call was not
+// allowed" from "the tool call failed" (call_error) and from "the tool call
+// succeeded" (outcome).
+//
+// outputs_json reuses the ExecuteResult.outputs_json chunking contract
+// verbatim: when chunk is non-nil, collect all fragments in Chunk.seq order,
+// concatenate, then decode; when chunk is nil, outputs_json is the whole
+// object in one message.
+type ToolCallResult struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	RequestId string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // correlates with the caller's permission.request payload
+	// outcome is the callee's ExecuteResult outcome; meaningless when
+	// call_error is set.
+	Outcome string `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	// chunk is non-nil when outputs_json is a fragment.
+	Chunk *Chunk `protobuf:"bytes,3,opt,name=chunk,proto3" json:"chunk,omitempty"`
+	// outputs_json is the JSON-encoded bytes of the callee's outputs object,
+	// with the same native-JSON-type encoding as ExecuteResult.outputs_json.
+	// When chunk is non-nil, collect all fragments in Chunk.seq order,
+	// concatenate, then decode; when chunk is nil, outputs_json is the whole
+	// object in one message.
+	OutputsJson []byte `protobuf:"bytes,4,opt,name=outputs_json,json=outputsJson,proto3" json:"outputs_json,omitempty"`
+	// call_error carries a well-known typed host-side failure for the tool
+	// call; non-empty means typed failure (outcome and outputs_json are then
+	// meaningless). It is a free-form registry, not an enum: unknown values
+	// must round-trip unchanged. Well-known values:
+	//
+	//	unknown_adapter    — the target names no declared adapter instance
+	//	unknown_tool       — the callee presents no such tool
+	//	capability_missing — the callee presents no tool surface for the call
+	//	host_unsupported   — the host predates adapter tools (a granted call
+	//	                     came back as a bare allow-grant with no result)
+	//	depth_exceeded     — the tool-call stack exceeded policy.max_tool_depth
+	//	cycle_detected     — runtime cycle detection fired on the call graph
+	//	callee_crash       — the callee's Execute failed before returning a result
+	//	callee_timeout     — the callee did not answer within its deadline
+	//	canceled           — the call was abandoned (run canceled) while in flight
+	//	not_yet_supported  — a planned behavior is not implemented yet
+	//	                     (e.g. pause/resume while a call is in flight)
+	//	self_call          — the callee is the calling adapter's own instance
+	CallError     string `protobuf:"bytes,5,opt,name=call_error,json=callError,proto3" json:"call_error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ToolCallResult) Reset() {
+	*x = ToolCallResult{}
+	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ToolCallResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ToolCallResult) ProtoMessage() {}
+
+func (x *ToolCallResult) ProtoReflect() protoreflect.Message {
+	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ToolCallResult.ProtoReflect.Descriptor instead.
+func (*ToolCallResult) Descriptor() ([]byte, []int) {
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ToolCallResult) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *ToolCallResult) GetOutcome() string {
+	if x != nil {
+		return x.Outcome
+	}
+	return ""
+}
+
+func (x *ToolCallResult) GetChunk() *Chunk {
+	if x != nil {
+		return x.Chunk
+	}
+	return nil
+}
+
+func (x *ToolCallResult) GetOutputsJson() []byte {
+	if x != nil {
+		return x.OutputsJson
+	}
+	return nil
+}
+
+func (x *ToolCallResult) GetCallError() string {
+	if x != nil {
+		return x.CallError
+	}
+	return ""
+}
+
+// PermissionEvent is the host-to-adapter message on the Permissions stream.
+// It is how the host answers a blocking `permission.request` AdapterEvent
+// (emitted by the adapter on the Execute stream), correlated by request_id:
+//
+//   - request: allow-grant. The adapter may proceed with the permitted call.
+//   - cancel: deny. Callers treat cancel as the deny of the correlated
+//     request; the call never runs.
+//   - tool_call_result: the completed result of an adapter tool call
+//     (success or typed failure) — see ToolCallResult. Results NEVER ride
+//     PermissionDecision; see that message's comment for why.
+//
+// Adapter tool-call request payload — the call itself needs no new message;
+// it rides the existing `permission.request` AdapterEvent on the Execute
+// stream, in map form:
+//
+//	{
+//	  "kind":         "adapter_tool", // distinguishes tool calls from other permission requests
+//	  "request_id":   "<minted by the calling adapter>",
+//	  "target":       "adapter.<type>.<name>.tools[.<tool>]", // full target string
+//	  "tool":         "<tool>", // the tool name only (no adapter prefix)
+//	  "args":         { ... }, // JSON object of call arguments
+//	  "args_digest":  "<sha256(canonical_json(args))>", // see criteriav2.ArgsDigest
+//	  "args_preview": "<optional short printable preview of args>"
+//	}
+//
+// A granted call is answered with request (allow-grant) followed by
+// tool_call_result; a denied call is answered with cancel. A granted call
+// answered only by a bare request with no subsequent tool_call_result means
+// the host predates adapter tools: callers surface that as the typed
+// host_unsupported failure. Hosts advertise support with the "adapter_tools"
+// capability string in InfoResponse.capabilities.
 type PermissionEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Event:
 	//
 	//	*PermissionEvent_Request
 	//	*PermissionEvent_Cancel
+	//	*PermissionEvent_ToolCallResult
 	Event         isPermissionEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1381,7 +1555,7 @@ type PermissionEvent struct {
 
 func (x *PermissionEvent) Reset() {
 	*x = PermissionEvent{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1393,7 +1567,7 @@ func (x *PermissionEvent) String() string {
 func (*PermissionEvent) ProtoMessage() {}
 
 func (x *PermissionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1406,7 +1580,7 @@ func (x *PermissionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionEvent.ProtoReflect.Descriptor instead.
 func (*PermissionEvent) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{19}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *PermissionEvent) GetEvent() isPermissionEvent_Event {
@@ -1434,6 +1608,15 @@ func (x *PermissionEvent) GetCancel() *PermissionCancel {
 	return nil
 }
 
+func (x *PermissionEvent) GetToolCallResult() *ToolCallResult {
+	if x != nil {
+		if x, ok := x.Event.(*PermissionEvent_ToolCallResult); ok {
+			return x.ToolCallResult
+		}
+	}
+	return nil
+}
+
 type isPermissionEvent_Event interface {
 	isPermissionEvent_Event()
 }
@@ -1446,13 +1629,26 @@ type PermissionEvent_Cancel struct {
 	Cancel *PermissionCancel `protobuf:"bytes,2,opt,name=cancel,proto3,oneof"`
 }
 
+type PermissionEvent_ToolCallResult struct {
+	ToolCallResult *ToolCallResult `protobuf:"bytes,3,opt,name=tool_call_result,json=toolCallResult,proto3,oneof"`
+}
+
 func (*PermissionEvent_Request) isPermissionEvent_Event() {}
 
 func (*PermissionEvent_Cancel) isPermissionEvent_Event() {}
 
+func (*PermissionEvent_ToolCallResult) isPermissionEvent_Event() {}
+
 // PermissionDecision is the server-to-client message on the Permissions stream.
 // The host answers requests in any order; multiple requests may be in flight.
 // heartbeat is non-nil when this message is a liveness ping with no decision.
+//
+// PermissionDecision is strictly an ACK channel: it carries only
+// allow/deny acknowledgments and liveness pings. Tool-call results NEVER ride
+// it — the host drains and discards PermissionDecision messages, so anything
+// sent here would flow into the drain and never reach the caller. Results
+// travel on PermissionEvent (tool_call_result) in the host-to-adapter
+// direction instead.
 type PermissionDecision struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -1465,7 +1661,7 @@ type PermissionDecision struct {
 
 func (x *PermissionDecision) Reset() {
 	*x = PermissionDecision{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1477,7 +1673,7 @@ func (x *PermissionDecision) String() string {
 func (*PermissionDecision) ProtoMessage() {}
 
 func (x *PermissionDecision) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1490,7 +1686,7 @@ func (x *PermissionDecision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionDecision.ProtoReflect.Descriptor instead.
 func (*PermissionDecision) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{20}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *PermissionDecision) GetRequestId() string {
@@ -1530,7 +1726,7 @@ type PauseRequest struct {
 
 func (x *PauseRequest) Reset() {
 	*x = PauseRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1542,7 +1738,7 @@ func (x *PauseRequest) String() string {
 func (*PauseRequest) ProtoMessage() {}
 
 func (x *PauseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1555,7 +1751,7 @@ func (x *PauseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseRequest.ProtoReflect.Descriptor instead.
 func (*PauseRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{21}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *PauseRequest) GetSessionId() string {
@@ -1573,7 +1769,7 @@ type PauseResponse struct {
 
 func (x *PauseResponse) Reset() {
 	*x = PauseResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1585,7 +1781,7 @@ func (x *PauseResponse) String() string {
 func (*PauseResponse) ProtoMessage() {}
 
 func (x *PauseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1598,7 +1794,7 @@ func (x *PauseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseResponse.ProtoReflect.Descriptor instead.
 func (*PauseResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{22}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{23}
 }
 
 type ResumeRequest struct {
@@ -1610,7 +1806,7 @@ type ResumeRequest struct {
 
 func (x *ResumeRequest) Reset() {
 	*x = ResumeRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1622,7 +1818,7 @@ func (x *ResumeRequest) String() string {
 func (*ResumeRequest) ProtoMessage() {}
 
 func (x *ResumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1635,7 +1831,7 @@ func (x *ResumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeRequest.ProtoReflect.Descriptor instead.
 func (*ResumeRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{23}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ResumeRequest) GetSessionId() string {
@@ -1653,7 +1849,7 @@ type ResumeResponse struct {
 
 func (x *ResumeResponse) Reset() {
 	*x = ResumeResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1665,7 +1861,7 @@ func (x *ResumeResponse) String() string {
 func (*ResumeResponse) ProtoMessage() {}
 
 func (x *ResumeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1678,7 +1874,7 @@ func (x *ResumeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeResponse.ProtoReflect.Descriptor instead.
 func (*ResumeResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{24}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{25}
 }
 
 type SnapshotRequest struct {
@@ -1690,7 +1886,7 @@ type SnapshotRequest struct {
 
 func (x *SnapshotRequest) Reset() {
 	*x = SnapshotRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1702,7 +1898,7 @@ func (x *SnapshotRequest) String() string {
 func (*SnapshotRequest) ProtoMessage() {}
 
 func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1715,7 +1911,7 @@ func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{25}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SnapshotRequest) GetSessionId() string {
@@ -1735,7 +1931,7 @@ type SnapshotResponse struct {
 
 func (x *SnapshotResponse) Reset() {
 	*x = SnapshotResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1747,7 +1943,7 @@ func (x *SnapshotResponse) String() string {
 func (*SnapshotResponse) ProtoMessage() {}
 
 func (x *SnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1760,7 +1956,7 @@ func (x *SnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotResponse.ProtoReflect.Descriptor instead.
 func (*SnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{26}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *SnapshotResponse) GetState() []byte {
@@ -1788,7 +1984,7 @@ type RestoreRequest struct {
 
 func (x *RestoreRequest) Reset() {
 	*x = RestoreRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1800,7 +1996,7 @@ func (x *RestoreRequest) String() string {
 func (*RestoreRequest) ProtoMessage() {}
 
 func (x *RestoreRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1813,7 +2009,7 @@ func (x *RestoreRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreRequest.ProtoReflect.Descriptor instead.
 func (*RestoreRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{27}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *RestoreRequest) GetSessionId() string {
@@ -1845,7 +2041,7 @@ type RestoreResponse struct {
 
 func (x *RestoreResponse) Reset() {
 	*x = RestoreResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1857,7 +2053,7 @@ func (x *RestoreResponse) String() string {
 func (*RestoreResponse) ProtoMessage() {}
 
 func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1870,7 +2066,7 @@ func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreResponse.ProtoReflect.Descriptor instead.
 func (*RestoreResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{28}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{29}
 }
 
 // SnapshotVersionMismatch is returned as a gRPC/Connect error detail when a
@@ -1887,7 +2083,7 @@ type SnapshotVersionMismatch struct {
 
 func (x *SnapshotVersionMismatch) Reset() {
 	*x = SnapshotVersionMismatch{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1899,7 +2095,7 @@ func (x *SnapshotVersionMismatch) String() string {
 func (*SnapshotVersionMismatch) ProtoMessage() {}
 
 func (x *SnapshotVersionMismatch) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1912,7 +2108,7 @@ func (x *SnapshotVersionMismatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotVersionMismatch.ProtoReflect.Descriptor instead.
 func (*SnapshotVersionMismatch) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{29}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *SnapshotVersionMismatch) GetHave() uint32 {
@@ -1938,7 +2134,7 @@ type InspectRequest struct {
 
 func (x *InspectRequest) Reset() {
 	*x = InspectRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1950,7 +2146,7 @@ func (x *InspectRequest) String() string {
 func (*InspectRequest) ProtoMessage() {}
 
 func (x *InspectRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1963,7 +2159,7 @@ func (x *InspectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectRequest.ProtoReflect.Descriptor instead.
 func (*InspectRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{30}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *InspectRequest) GetSessionId() string {
@@ -1985,7 +2181,7 @@ type InspectField struct {
 
 func (x *InspectField) Reset() {
 	*x = InspectField{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1997,7 +2193,7 @@ func (x *InspectField) String() string {
 func (*InspectField) ProtoMessage() {}
 
 func (x *InspectField) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2010,7 +2206,7 @@ func (x *InspectField) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectField.ProtoReflect.Descriptor instead.
 func (*InspectField) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{31}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *InspectField) GetKey() string {
@@ -2047,7 +2243,7 @@ type InspectResponse struct {
 
 func (x *InspectResponse) Reset() {
 	*x = InspectResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2059,7 +2255,7 @@ func (x *InspectResponse) String() string {
 func (*InspectResponse) ProtoMessage() {}
 
 func (x *InspectResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2072,7 +2268,7 @@ func (x *InspectResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectResponse.ProtoReflect.Descriptor instead.
 func (*InspectResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{32}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *InspectResponse) GetCurrentStep() string {
@@ -2237,10 +2433,19 @@ const file_criteria_v2_adapter_proto_rawDesc = "" +
 	"\x10PermissionCancel\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reasonJ\x05\bd\x10\xe8\a\"\x96\x01\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reasonJ\x05\bd\x10\xe8\a\"\xbc\x01\n" +
+	"\x0eToolCallResult\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12\x18\n" +
+	"\aoutcome\x18\x02 \x01(\tR\aoutcome\x12(\n" +
+	"\x05chunk\x18\x03 \x01(\v2\x12.criteria.v2.ChunkR\x05chunk\x12!\n" +
+	"\foutputs_json\x18\x04 \x01(\fR\voutputsJson\x12\x1d\n" +
+	"\n" +
+	"call_error\x18\x05 \x01(\tR\tcallErrorJ\x05\bd\x10\xe8\a\"\xdf\x01\n" +
 	"\x0fPermissionEvent\x12:\n" +
 	"\arequest\x18\x01 \x01(\v2\x1e.criteria.v2.PermissionRequestH\x00R\arequest\x127\n" +
-	"\x06cancel\x18\x02 \x01(\v2\x1d.criteria.v2.PermissionCancelH\x00R\x06cancelB\a\n" +
+	"\x06cancel\x18\x02 \x01(\v2\x1d.criteria.v2.PermissionCancelH\x00R\x06cancel\x12G\n" +
+	"\x10tool_call_result\x18\x03 \x01(\v2\x1b.criteria.v2.ToolCallResultH\x00R\x0etoolCallResultB\a\n" +
 	"\x05eventJ\x05\bd\x10\xe8\a\"\xa4\x01\n" +
 	"\x12PermissionDecision\x12\x1d\n" +
 	"\n" +
@@ -2295,7 +2500,7 @@ const file_criteria_v2_adapter_proto_rawDesc = "" +
 	"\bSnapshot\x12\x1c.criteria.v2.SnapshotRequest\x1a\x1d.criteria.v2.SnapshotResponse\x12D\n" +
 	"\aRestore\x12\x1b.criteria.v2.RestoreRequest\x1a\x1c.criteria.v2.RestoreResponse\x12D\n" +
 	"\aInspect\x12\x1b.criteria.v2.InspectRequest\x1a\x1c.criteria.v2.InspectResponse\x12S\n" +
-	"\fCloseSession\x12 .criteria.v2.CloseSessionRequest\x1a!.criteria.v2.CloseSessionResponseB=Z;github.com/brokenbots/criteria/proto/criteria/v2;criteriav2b\x06proto3"
+	"\fCloseSession\x12 .criteria.v2.CloseSessionRequest\x1a!.criteria.v2.CloseSessionResponseBEZCgithub.com/brokenbots/criteria-adapter-proto/criteria/v2;criteriav2b\x06proto3"
 
 var (
 	file_criteria_v2_adapter_proto_rawDescOnce sync.Once
@@ -2309,7 +2514,7 @@ func file_criteria_v2_adapter_proto_rawDescGZIP() []byte {
 	return file_criteria_v2_adapter_proto_rawDescData
 }
 
-var file_criteria_v2_adapter_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_criteria_v2_adapter_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_criteria_v2_adapter_proto_goTypes = []any{
 	(*Chunk)(nil),                   // 0: criteria.v2.Chunk
 	(*Heartbeat)(nil),               // 1: criteria.v2.Heartbeat
@@ -2330,89 +2535,92 @@ var file_criteria_v2_adapter_proto_goTypes = []any{
 	(*LogEvent)(nil),                // 16: criteria.v2.LogEvent
 	(*PermissionRequest)(nil),       // 17: criteria.v2.PermissionRequest
 	(*PermissionCancel)(nil),        // 18: criteria.v2.PermissionCancel
-	(*PermissionEvent)(nil),         // 19: criteria.v2.PermissionEvent
-	(*PermissionDecision)(nil),      // 20: criteria.v2.PermissionDecision
-	(*PauseRequest)(nil),            // 21: criteria.v2.PauseRequest
-	(*PauseResponse)(nil),           // 22: criteria.v2.PauseResponse
-	(*ResumeRequest)(nil),           // 23: criteria.v2.ResumeRequest
-	(*ResumeResponse)(nil),          // 24: criteria.v2.ResumeResponse
-	(*SnapshotRequest)(nil),         // 25: criteria.v2.SnapshotRequest
-	(*SnapshotResponse)(nil),        // 26: criteria.v2.SnapshotResponse
-	(*RestoreRequest)(nil),          // 27: criteria.v2.RestoreRequest
-	(*RestoreResponse)(nil),         // 28: criteria.v2.RestoreResponse
-	(*SnapshotVersionMismatch)(nil), // 29: criteria.v2.SnapshotVersionMismatch
-	(*InspectRequest)(nil),          // 30: criteria.v2.InspectRequest
-	(*InspectField)(nil),            // 31: criteria.v2.InspectField
-	(*InspectResponse)(nil),         // 32: criteria.v2.InspectResponse
-	nil,                             // 33: criteria.v2.AdapterSchemaProto.FieldsEntry
-	nil,                             // 34: criteria.v2.InfoResponse.SecretsEntry
-	nil,                             // 35: criteria.v2.OpenSessionRequest.ConfigEntry
-	nil,                             // 36: criteria.v2.OpenSessionRequest.SecretsEntry
-	nil,                             // 37: criteria.v2.ExecuteRequest.InputEntry
-	nil,                             // 38: criteria.v2.ExecuteRequest.SecretInputsEntry
-	(*timestamppb.Timestamp)(nil),   // 39: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),         // 40: google.protobuf.Struct
-	(*structpb.Value)(nil),          // 41: google.protobuf.Value
+	(*ToolCallResult)(nil),          // 19: criteria.v2.ToolCallResult
+	(*PermissionEvent)(nil),         // 20: criteria.v2.PermissionEvent
+	(*PermissionDecision)(nil),      // 21: criteria.v2.PermissionDecision
+	(*PauseRequest)(nil),            // 22: criteria.v2.PauseRequest
+	(*PauseResponse)(nil),           // 23: criteria.v2.PauseResponse
+	(*ResumeRequest)(nil),           // 24: criteria.v2.ResumeRequest
+	(*ResumeResponse)(nil),          // 25: criteria.v2.ResumeResponse
+	(*SnapshotRequest)(nil),         // 26: criteria.v2.SnapshotRequest
+	(*SnapshotResponse)(nil),        // 27: criteria.v2.SnapshotResponse
+	(*RestoreRequest)(nil),          // 28: criteria.v2.RestoreRequest
+	(*RestoreResponse)(nil),         // 29: criteria.v2.RestoreResponse
+	(*SnapshotVersionMismatch)(nil), // 30: criteria.v2.SnapshotVersionMismatch
+	(*InspectRequest)(nil),          // 31: criteria.v2.InspectRequest
+	(*InspectField)(nil),            // 32: criteria.v2.InspectField
+	(*InspectResponse)(nil),         // 33: criteria.v2.InspectResponse
+	nil,                             // 34: criteria.v2.AdapterSchemaProto.FieldsEntry
+	nil,                             // 35: criteria.v2.InfoResponse.SecretsEntry
+	nil,                             // 36: criteria.v2.OpenSessionRequest.ConfigEntry
+	nil,                             // 37: criteria.v2.OpenSessionRequest.SecretsEntry
+	nil,                             // 38: criteria.v2.ExecuteRequest.InputEntry
+	nil,                             // 39: criteria.v2.ExecuteRequest.SecretInputsEntry
+	(*timestamppb.Timestamp)(nil),   // 40: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),         // 41: google.protobuf.Struct
+	(*structpb.Value)(nil),          // 42: google.protobuf.Value
 }
 var file_criteria_v2_adapter_proto_depIdxs = []int32{
-	39, // 0: criteria.v2.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
-	33, // 1: criteria.v2.AdapterSchemaProto.fields:type_name -> criteria.v2.AdapterSchemaProto.FieldsEntry
+	40, // 0: criteria.v2.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
+	34, // 1: criteria.v2.AdapterSchemaProto.fields:type_name -> criteria.v2.AdapterSchemaProto.FieldsEntry
 	3,  // 2: criteria.v2.InfoResponse.config_schema:type_name -> criteria.v2.AdapterSchemaProto
 	3,  // 3: criteria.v2.InfoResponse.input_schema:type_name -> criteria.v2.AdapterSchemaProto
 	3,  // 4: criteria.v2.InfoResponse.output_schema:type_name -> criteria.v2.AdapterSchemaProto
-	34, // 5: criteria.v2.InfoResponse.secrets:type_name -> criteria.v2.InfoResponse.SecretsEntry
-	35, // 6: criteria.v2.OpenSessionRequest.config:type_name -> criteria.v2.OpenSessionRequest.ConfigEntry
-	36, // 7: criteria.v2.OpenSessionRequest.secrets:type_name -> criteria.v2.OpenSessionRequest.SecretsEntry
-	37, // 8: criteria.v2.ExecuteRequest.input:type_name -> criteria.v2.ExecuteRequest.InputEntry
-	38, // 9: criteria.v2.ExecuteRequest.secret_inputs:type_name -> criteria.v2.ExecuteRequest.SecretInputsEntry
-	40, // 10: criteria.v2.AdapterEvent.payload:type_name -> google.protobuf.Struct
-	39, // 11: criteria.v2.AdapterEvent.emitted_at:type_name -> google.protobuf.Timestamp
+	35, // 5: criteria.v2.InfoResponse.secrets:type_name -> criteria.v2.InfoResponse.SecretsEntry
+	36, // 6: criteria.v2.OpenSessionRequest.config:type_name -> criteria.v2.OpenSessionRequest.ConfigEntry
+	37, // 7: criteria.v2.OpenSessionRequest.secrets:type_name -> criteria.v2.OpenSessionRequest.SecretsEntry
+	38, // 8: criteria.v2.ExecuteRequest.input:type_name -> criteria.v2.ExecuteRequest.InputEntry
+	39, // 9: criteria.v2.ExecuteRequest.secret_inputs:type_name -> criteria.v2.ExecuteRequest.SecretInputsEntry
+	41, // 10: criteria.v2.AdapterEvent.payload:type_name -> google.protobuf.Struct
+	40, // 11: criteria.v2.AdapterEvent.emitted_at:type_name -> google.protobuf.Timestamp
 	0,  // 12: criteria.v2.AdapterEvent.chunk:type_name -> criteria.v2.Chunk
-	40, // 13: criteria.v2.ToolInvocation.args:type_name -> google.protobuf.Struct
-	39, // 14: criteria.v2.ToolInvocation.invoked_at:type_name -> google.protobuf.Timestamp
+	41, // 13: criteria.v2.ToolInvocation.args:type_name -> google.protobuf.Struct
+	40, // 14: criteria.v2.ToolInvocation.invoked_at:type_name -> google.protobuf.Timestamp
 	0,  // 15: criteria.v2.ExecuteResult.chunk:type_name -> criteria.v2.Chunk
 	11, // 16: criteria.v2.ExecuteEvent.adapter:type_name -> criteria.v2.AdapterEvent
 	12, // 17: criteria.v2.ExecuteEvent.tool:type_name -> criteria.v2.ToolInvocation
 	13, // 18: criteria.v2.ExecuteEvent.result:type_name -> criteria.v2.ExecuteResult
 	1,  // 19: criteria.v2.ExecuteEvent.heartbeat:type_name -> criteria.v2.Heartbeat
-	39, // 20: criteria.v2.LogEvent.timestamp:type_name -> google.protobuf.Timestamp
+	40, // 20: criteria.v2.LogEvent.timestamp:type_name -> google.protobuf.Timestamp
 	1,  // 21: criteria.v2.LogEvent.heartbeat:type_name -> criteria.v2.Heartbeat
 	0,  // 22: criteria.v2.LogEvent.chunk:type_name -> criteria.v2.Chunk
-	17, // 23: criteria.v2.PermissionEvent.request:type_name -> criteria.v2.PermissionRequest
-	18, // 24: criteria.v2.PermissionEvent.cancel:type_name -> criteria.v2.PermissionCancel
-	1,  // 25: criteria.v2.PermissionDecision.heartbeat:type_name -> criteria.v2.Heartbeat
-	41, // 26: criteria.v2.InspectField.value:type_name -> google.protobuf.Value
-	39, // 27: criteria.v2.InspectResponse.last_activity_at:type_name -> google.protobuf.Timestamp
-	31, // 28: criteria.v2.InspectResponse.fields:type_name -> criteria.v2.InspectField
-	40, // 29: criteria.v2.InspectResponse.extra:type_name -> google.protobuf.Struct
-	2,  // 30: criteria.v2.AdapterSchemaProto.FieldsEntry.value:type_name -> criteria.v2.ConfigFieldProto
-	4,  // 31: criteria.v2.AdapterService.Info:input_type -> criteria.v2.InfoRequest
-	6,  // 32: criteria.v2.AdapterService.OpenSession:input_type -> criteria.v2.OpenSessionRequest
-	10, // 33: criteria.v2.AdapterService.Execute:input_type -> criteria.v2.ExecuteRequest
-	15, // 34: criteria.v2.AdapterService.Log:input_type -> criteria.v2.LogRequest
-	19, // 35: criteria.v2.AdapterService.Permissions:input_type -> criteria.v2.PermissionEvent
-	21, // 36: criteria.v2.AdapterService.Pause:input_type -> criteria.v2.PauseRequest
-	23, // 37: criteria.v2.AdapterService.Resume:input_type -> criteria.v2.ResumeRequest
-	25, // 38: criteria.v2.AdapterService.Snapshot:input_type -> criteria.v2.SnapshotRequest
-	27, // 39: criteria.v2.AdapterService.Restore:input_type -> criteria.v2.RestoreRequest
-	30, // 40: criteria.v2.AdapterService.Inspect:input_type -> criteria.v2.InspectRequest
-	8,  // 41: criteria.v2.AdapterService.CloseSession:input_type -> criteria.v2.CloseSessionRequest
-	5,  // 42: criteria.v2.AdapterService.Info:output_type -> criteria.v2.InfoResponse
-	7,  // 43: criteria.v2.AdapterService.OpenSession:output_type -> criteria.v2.OpenSessionResponse
-	14, // 44: criteria.v2.AdapterService.Execute:output_type -> criteria.v2.ExecuteEvent
-	16, // 45: criteria.v2.AdapterService.Log:output_type -> criteria.v2.LogEvent
-	20, // 46: criteria.v2.AdapterService.Permissions:output_type -> criteria.v2.PermissionDecision
-	22, // 47: criteria.v2.AdapterService.Pause:output_type -> criteria.v2.PauseResponse
-	24, // 48: criteria.v2.AdapterService.Resume:output_type -> criteria.v2.ResumeResponse
-	26, // 49: criteria.v2.AdapterService.Snapshot:output_type -> criteria.v2.SnapshotResponse
-	28, // 50: criteria.v2.AdapterService.Restore:output_type -> criteria.v2.RestoreResponse
-	32, // 51: criteria.v2.AdapterService.Inspect:output_type -> criteria.v2.InspectResponse
-	9,  // 52: criteria.v2.AdapterService.CloseSession:output_type -> criteria.v2.CloseSessionResponse
-	42, // [42:53] is the sub-list for method output_type
-	31, // [31:42] is the sub-list for method input_type
-	31, // [31:31] is the sub-list for extension type_name
-	31, // [31:31] is the sub-list for extension extendee
-	0,  // [0:31] is the sub-list for field type_name
+	0,  // 23: criteria.v2.ToolCallResult.chunk:type_name -> criteria.v2.Chunk
+	17, // 24: criteria.v2.PermissionEvent.request:type_name -> criteria.v2.PermissionRequest
+	18, // 25: criteria.v2.PermissionEvent.cancel:type_name -> criteria.v2.PermissionCancel
+	19, // 26: criteria.v2.PermissionEvent.tool_call_result:type_name -> criteria.v2.ToolCallResult
+	1,  // 27: criteria.v2.PermissionDecision.heartbeat:type_name -> criteria.v2.Heartbeat
+	42, // 28: criteria.v2.InspectField.value:type_name -> google.protobuf.Value
+	40, // 29: criteria.v2.InspectResponse.last_activity_at:type_name -> google.protobuf.Timestamp
+	32, // 30: criteria.v2.InspectResponse.fields:type_name -> criteria.v2.InspectField
+	41, // 31: criteria.v2.InspectResponse.extra:type_name -> google.protobuf.Struct
+	2,  // 32: criteria.v2.AdapterSchemaProto.FieldsEntry.value:type_name -> criteria.v2.ConfigFieldProto
+	4,  // 33: criteria.v2.AdapterService.Info:input_type -> criteria.v2.InfoRequest
+	6,  // 34: criteria.v2.AdapterService.OpenSession:input_type -> criteria.v2.OpenSessionRequest
+	10, // 35: criteria.v2.AdapterService.Execute:input_type -> criteria.v2.ExecuteRequest
+	15, // 36: criteria.v2.AdapterService.Log:input_type -> criteria.v2.LogRequest
+	20, // 37: criteria.v2.AdapterService.Permissions:input_type -> criteria.v2.PermissionEvent
+	22, // 38: criteria.v2.AdapterService.Pause:input_type -> criteria.v2.PauseRequest
+	24, // 39: criteria.v2.AdapterService.Resume:input_type -> criteria.v2.ResumeRequest
+	26, // 40: criteria.v2.AdapterService.Snapshot:input_type -> criteria.v2.SnapshotRequest
+	28, // 41: criteria.v2.AdapterService.Restore:input_type -> criteria.v2.RestoreRequest
+	31, // 42: criteria.v2.AdapterService.Inspect:input_type -> criteria.v2.InspectRequest
+	8,  // 43: criteria.v2.AdapterService.CloseSession:input_type -> criteria.v2.CloseSessionRequest
+	5,  // 44: criteria.v2.AdapterService.Info:output_type -> criteria.v2.InfoResponse
+	7,  // 45: criteria.v2.AdapterService.OpenSession:output_type -> criteria.v2.OpenSessionResponse
+	14, // 46: criteria.v2.AdapterService.Execute:output_type -> criteria.v2.ExecuteEvent
+	16, // 47: criteria.v2.AdapterService.Log:output_type -> criteria.v2.LogEvent
+	21, // 48: criteria.v2.AdapterService.Permissions:output_type -> criteria.v2.PermissionDecision
+	23, // 49: criteria.v2.AdapterService.Pause:output_type -> criteria.v2.PauseResponse
+	25, // 50: criteria.v2.AdapterService.Resume:output_type -> criteria.v2.ResumeResponse
+	27, // 51: criteria.v2.AdapterService.Snapshot:output_type -> criteria.v2.SnapshotResponse
+	29, // 52: criteria.v2.AdapterService.Restore:output_type -> criteria.v2.RestoreResponse
+	33, // 53: criteria.v2.AdapterService.Inspect:output_type -> criteria.v2.InspectResponse
+	9,  // 54: criteria.v2.AdapterService.CloseSession:output_type -> criteria.v2.CloseSessionResponse
+	44, // [44:55] is the sub-list for method output_type
+	33, // [33:44] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_criteria_v2_adapter_proto_init() }
@@ -2427,9 +2635,10 @@ func file_criteria_v2_adapter_proto_init() {
 		(*ExecuteEvent_Result)(nil),
 		(*ExecuteEvent_Heartbeat)(nil),
 	}
-	file_criteria_v2_adapter_proto_msgTypes[19].OneofWrappers = []any{
+	file_criteria_v2_adapter_proto_msgTypes[20].OneofWrappers = []any{
 		(*PermissionEvent_Request)(nil),
 		(*PermissionEvent_Cancel)(nil),
+		(*PermissionEvent_ToolCallResult)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -2437,7 +2646,7 @@ func file_criteria_v2_adapter_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_criteria_v2_adapter_proto_rawDesc), len(file_criteria_v2_adapter_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   39,
+			NumMessages:   40,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
