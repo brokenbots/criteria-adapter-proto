@@ -256,6 +256,139 @@ func TestPermissionEvent_CancelVariant_RoundTrip(t *testing.T) {
 	assert.True(t, proto.Equal(msg, got))
 }
 
+// TestPermissionEvent_ToolCallResult_Success_RoundTrip round-trips a granted
+// adapter tool call answered with its callee result: request_id correlates
+// with the caller's permission.request payload, and outcome + outputs_json
+// carry the callee's data.
+func TestPermissionEvent_ToolCallResult_Success_RoundTrip(t *testing.T) {
+	msg := &criteriav2.PermissionEvent{
+		Event: &criteriav2.PermissionEvent_ToolCallResult{
+			ToolCallResult: &criteriav2.ToolCallResult{
+				RequestId: "call-1",
+				Outcome:   "success",
+				OutputsJson: []byte(
+					`{"issue_url":"https://github.com/octo/repo/issues/1","number":1}`),
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	assert.True(t, proto.Equal(msg, got))
+
+	res := got.GetToolCallResult()
+	require.NotNil(t, res, "tool_call_result oneof member must survive the round trip")
+	assert.Equal(t, "call-1", res.RequestId)
+	assert.Equal(t, "success", res.Outcome)
+	assert.Empty(t, res.CallError, "success result must not carry a typed failure")
+	assert.JSONEq(t, `{"issue_url":"https://github.com/octo/repo/issues/1","number":1}`, string(res.OutputsJson))
+}
+
+// TestPermissionEvent_ToolCallResult_ChunkedOutputs_RoundTrip proves the
+// chunked encoding for ToolCallResult.outputs_json: the whole object is split
+// into fragment PermissionEvent messages (Chunk framing reused verbatim from
+// ExecuteResult), each fragment is proto-marshalled and unmarshalled as it
+// would arrive on the Permissions stream, and the callee's outputs are
+// reconstructable from those messages alone.
+func TestPermissionEvent_ToolCallResult_ChunkedOutputs_RoundTrip(t *testing.T) {
+	originalOutputs := map[string]any{
+		"issue_url": "https://github.com/octo/repo/issues/1",
+		"number":    1,
+		"labels":    []string{"bug", "help wanted"},
+	}
+	outputsJSON, err := json.Marshal(originalOutputs)
+	require.NoError(t, err)
+
+	const chunkSize = 12
+	base := &criteriav2.ToolCallResult{RequestId: "call-1", Outcome: "success"}
+	fragments := criteriav2.ChunkToolCallResultOutputs(base, outputsJSON, chunkSize)
+	require.Greater(t, len(fragments), 1, "outputs must be split into multiple fragments")
+
+	events := make([]*criteriav2.ToolCallResult, len(fragments))
+	for i, frag := range fragments {
+		ev := &criteriav2.PermissionEvent{
+			Event: &criteriav2.PermissionEvent_ToolCallResult{ToolCallResult: frag},
+		}
+		var decoded criteriav2.PermissionEvent
+		b, merr := proto.Marshal(ev)
+		require.NoError(t, merr)
+		require.NoError(t, proto.Unmarshal(b, &decoded))
+
+		res := decoded.GetToolCallResult()
+		require.NotNilf(t, res, "fragment[%d] must survive the round trip", i)
+		require.NotNilf(t, res.Chunk, "fragment[%d] must carry Chunk metadata", i)
+		assert.Equal(t, uint32(i), res.Chunk.Seq)
+		assert.Equal(t, uint32(len(fragments)), res.Chunk.Total)
+		assert.Equal(t, i == len(fragments)-1, res.Chunk.Final, "only the last fragment sets final")
+		assert.Equal(t, base.RequestId, res.RequestId, "request_id is preserved on every fragment")
+		events[i] = res
+	}
+
+	joined, jerr := criteriav2.JoinToolCallResultOutputs(events)
+	require.NoError(t, jerr)
+
+	var gotOutputs map[string]any
+	require.NoError(t, json.Unmarshal(joined, &gotOutputs))
+	assert.Len(t, gotOutputs, len(originalOutputs))
+	assert.Equal(t, "https://github.com/octo/repo/issues/1", gotOutputs["issue_url"])
+}
+
+// TestPermissionEvent_ToolCallResult_TypedFailure_RoundTrip round-trips a
+// call_error-only result: non-empty call_error means typed failure, so
+// outcome and outputs_json are meaningless (unset here, and SDKs must ignore
+// them even when present).
+func TestPermissionEvent_ToolCallResult_TypedFailure_RoundTrip(t *testing.T) {
+	msg := &criteriav2.PermissionEvent{
+		Event: &criteriav2.PermissionEvent_ToolCallResult{
+			ToolCallResult: &criteriav2.ToolCallResult{
+				RequestId: "call-2",
+				CallError: "unknown_tool",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	assert.True(t, proto.Equal(msg, got))
+
+	res := got.GetToolCallResult()
+	require.NotNil(t, res)
+	assert.Equal(t, "unknown_tool", res.CallError)
+	assert.Empty(t, res.Outcome, "typed failure must not carry an outcome")
+	assert.Nil(t, res.Chunk, "typed failure must not carry chunk framing")
+	assert.Nil(t, res.OutputsJson, "typed failure must not carry outputs")
+}
+
+// TestPermissionEvent_ToolCallResult_UnknownCallErrorRoundTrips verifies the
+// call_error registry is free-form: values added after this SDK's release
+// must round-trip unchanged so newer hosts degrade gracefully.
+func TestPermissionEvent_ToolCallResult_UnknownCallErrorRoundTrips(t *testing.T) {
+	msg := &criteriav2.PermissionEvent{
+		Event: &criteriav2.PermissionEvent_ToolCallResult{
+			ToolCallResult: &criteriav2.ToolCallResult{
+				RequestId: "call-3",
+				CallError: "some_future_error_code",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	assert.True(t, proto.Equal(msg, got))
+	assert.Equal(t, "some_future_error_code", got.GetToolCallResult().CallError)
+}
+
+// TestToolCallResult_WellKnownCallErrorValues pins the well-known call_error
+// registry documented on the proto message so SDK switch statements and
+// host constants stay aligned.
+func TestToolCallResult_WellKnownCallErrorValues(t *testing.T) {
+	wellKnown := []string{
+		"unknown_adapter", "unknown_tool", "capability_missing",
+		"host_unsupported", "depth_exceeded", "cycle_detected",
+		"callee_crash", "callee_timeout", "canceled",
+		"not_yet_supported", "self_call",
+	}
+	for _, v := range wellKnown {
+		res := &criteriav2.ToolCallResult{RequestId: "r", CallError: v}
+		got := roundTrip(t, res)
+		assert.Equal(t, v, got.CallError, "call_error value %q must round-trip", v)
+	}
+}
+
 func TestPermissionDecision_RoundTrip(t *testing.T) {
 	msg := &criteriav2.PermissionDecision{
 		RequestId: "req-1",
@@ -659,6 +792,7 @@ func TestReservedFields_100To999Block(t *testing.T) {
 		"PermissionRequest",
 		"PermissionCancel",
 		"PermissionEvent",
+		"ToolCallResult",
 		"PermissionDecision",
 		"PauseRequest",
 		"PauseResponse",

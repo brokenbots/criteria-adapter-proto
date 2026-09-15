@@ -2,7 +2,10 @@ package criteriav2_test
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -28,9 +31,14 @@ type minimalAdapterServer struct {
 // The server is stopped automatically at the end of the test via t.Cleanup.
 func newBufconnServer(t *testing.T) *bufconn.Listener {
 	t.Helper()
+	return newBufconnServerWith(t, &minimalAdapterServer{})
+}
+
+func newBufconnServerWith(t *testing.T, impl criteriav2.AdapterServiceServer) *bufconn.Listener {
+	t.Helper()
 	lis := bufconn.Listen(1 << 20) // 1 MiB buffer
 	srv := grpc.NewServer()
-	criteriav2.RegisterAdapterServiceServer(srv, &minimalAdapterServer{})
+	criteriav2.RegisterAdapterServiceServer(srv, impl)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	return lis
@@ -201,4 +209,161 @@ func TestAdapterService_InProcess_Permissions(t *testing.T) {
 	require.Error(t, recvErr)
 	assert.Equal(t, codes.Unimplemented, status.Code(recvErr),
 		"Permissions Recv must return Unimplemented from the stub server")
+}
+
+// permissionsRecordingServer is an adapter-role Permissions implementation
+// that records every host-sent PermissionEvent and ACKs each one with a
+// PermissionDecision, as an adapter observing the CRI-152 tool-call-result
+// flow would.
+type permissionsRecordingServer struct {
+	criteriav2.UnimplementedAdapterServiceServer
+
+	mu     sync.Mutex
+	events []*criteriav2.PermissionEvent
+}
+
+func (s *permissionsRecordingServer) recorded() []*criteriav2.PermissionEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*criteriav2.PermissionEvent, len(s.events))
+	copy(out, s.events)
+	return out
+}
+
+func (s *permissionsRecordingServer) Permissions(stream criteriav2.AdapterService_PermissionsServer) error {
+	for {
+		ev, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.events = append(s.events, ev)
+		s.mu.Unlock()
+
+		// ACK the host the way an adapter would (the host drains and
+		// discards these; they must not be used to carry results).
+		ack := &criteriav2.PermissionDecision{Decision: "ack"}
+		if req := ev.GetRequest(); req != nil {
+			ack.RequestId = req.RequestId
+		}
+		if err := stream.Send(ack); err != nil {
+			return err
+		}
+	}
+}
+
+// TestAdapterService_Permissions_ToolCallResult_Contract exercises the
+// CRI-152 tool-call-result flow end to end over a real bidi Permissions
+// stream (bufconn): the host sends chunked tool_call_result fragments for one
+// call, a call_error-only result for another, and a cancel for a third; the
+// adapter role records the events and ACKs, the host reads its ACKs, and the
+// callee's outputs are reassembled from the recorded fragments alone —
+// proving chunk framing (seq ordering + final flag) survives the wire and
+// that typed failures travel without outcome/outputs.
+func TestAdapterService_Permissions_ToolCallResult_Contract(t *testing.T) {
+	const chunkSize = 10
+	outputsJSON, err := json.Marshal(map[string]any{
+		"issue_url": "https://github.com/octo/repo/issues/1",
+		"number":    1,
+	})
+	require.NoError(t, err)
+
+	// Host side: chunk the callee's outputs into tool_call_result fragments
+	// and stream them, followed by a typed failure and a deny.
+	base := &criteriav2.ToolCallResult{RequestId: "call-1", Outcome: "success"}
+	fragments := criteriav2.ChunkToolCallResultOutputs(base, outputsJSON, chunkSize)
+	require.Greater(t, len(fragments), 1, "outputs must be chunked for the contract test")
+
+	var hostEvents []*criteriav2.PermissionEvent
+	for i, frag := range fragments {
+		hostEvents = append(hostEvents, &criteriav2.PermissionEvent{
+			Event: &criteriav2.PermissionEvent_ToolCallResult{ToolCallResult: frag},
+		})
+		assert.Equal(t, i == len(fragments)-1, frag.Chunk.Final, "fragment[%d] final flag", i)
+	}
+	hostEvents = append(hostEvents,
+		&criteriav2.PermissionEvent{
+			Event: &criteriav2.PermissionEvent_ToolCallResult{ToolCallResult: &criteriav2.ToolCallResult{
+				RequestId: "call-2",
+				CallError: "callee_timeout",
+			}},
+		},
+		&criteriav2.PermissionEvent{
+			Event: &criteriav2.PermissionEvent_Cancel{Cancel: &criteriav2.PermissionCancel{
+				RequestId: "call-3",
+				Reason:    "no matching allow_tools entry",
+			}},
+		},
+	)
+
+	srv := &permissionsRecordingServer{}
+	lis := newBufconnServerWith(t, srv)
+	client := newBufconnClient(t, lis)
+
+	stream, err := client.Permissions(context.Background())
+	require.NoError(t, err)
+
+	for _, ev := range hostEvents {
+		require.NoError(t, stream.Send(ev))
+	}
+	require.NoError(t, stream.CloseSend())
+
+	// The host drains the adapter's PermissionDecision ACKs (and discards
+	// them — they are the ACK channel, never a result channel).
+	ackCount := 0
+	for {
+		decision, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		assert.Equal(t, "ack", decision.Decision)
+		assert.Empty(t, decision.Reason, "ACK decisions carry no result data")
+		assert.Nil(t, decision.Heartbeat)
+		ackCount++
+	}
+	assert.Equal(t, len(hostEvents), ackCount, "one ACK per host event")
+
+	// Adapter side: correlate the recorded events by request_id and
+	// reassemble the callee's outputs from the fragments alone.
+	recorded := srv.recorded()
+	require.Len(t, recorded, len(hostEvents))
+
+	var callFragments []*criteriav2.ToolCallResult
+	var failure *criteriav2.ToolCallResult
+	var deny *criteriav2.PermissionCancel
+	for _, ev := range recorded {
+		switch {
+		case ev.GetToolCallResult() != nil:
+			res := ev.GetToolCallResult()
+			if res.CallError != "" {
+				failure = res
+			} else {
+				callFragments = append(callFragments, res)
+			}
+		case ev.GetCancel() != nil:
+			deny = ev.GetCancel()
+		}
+	}
+
+	joined, err := criteriav2.JoinToolCallResultOutputs(callFragments)
+	require.NoError(t, err)
+	var gotOutputs map[string]any
+	require.NoError(t, json.Unmarshal(joined, &gotOutputs))
+	assert.Equal(t, "https://github.com/octo/repo/issues/1", gotOutputs["issue_url"])
+	assert.Equal(t, float64(1), gotOutputs["number"])
+
+	// Typed failure: distinguishable from deny, outcome/outputs meaningless.
+	require.NotNil(t, failure)
+	assert.Equal(t, "call-2", failure.RequestId)
+	assert.Equal(t, "callee_timeout", failure.CallError)
+	assert.Empty(t, failure.Outcome)
+
+	// Deny rides cancel, unchanged.
+	require.NotNil(t, deny)
+	assert.Equal(t, "call-3", deny.RequestId)
+	assert.Equal(t, "no matching allow_tools entry", deny.Reason)
 }

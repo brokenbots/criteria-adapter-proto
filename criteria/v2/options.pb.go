@@ -55,7 +55,7 @@ var File_criteria_v2_options_proto protoreflect.FileDescriptor
 const file_criteria_v2_options_proto_rawDesc = "" +
 	"\n" +
 	"\x19criteria/v2/options.proto\x12\vcriteria.v2\x1a google/protobuf/descriptor.proto:=\n" +
-	"\tsensitive\x12\x1d.google.protobuf.FieldOptions\x18\xf0\xa2\x04 \x01(\bR\tsensitiveB=Z;github.com/brokenbots/criteria/proto/criteria/v2;criteriav2b\x06proto3"
+	"\tsensitive\x12\x1d.google.protobuf.FieldOptions\x18\xf0\xa2\x04 \x01(\bR\tsensitiveBEZCgithub.com/brokenbots/criteria-adapter-proto/criteria/v2;criteriav2b\x06proto3"
 
 var file_criteria_v2_options_proto_goTypes = []any{
 	(*descriptorpb.FieldOptions)(nil), // 0: google.protobuf.FieldOptions
