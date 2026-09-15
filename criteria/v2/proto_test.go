@@ -419,6 +419,113 @@ func TestToolCallResult_WellKnownCallErrorValues(t *testing.T) {
 	}
 }
 
+// TestPermissionEvent_OneofRoundTrip_ExactFieldValues proves the CRI-154
+// oneof round-trip contract: every PermissionEvent member — request, cancel,
+// and tool_call_result (in its success, chunked, and typed-failure shapes) —
+// decodes with the exact field values that were sent, and exactly one member
+// is set on the decoded event (the siblings stay nil).
+func TestPermissionEvent_OneofRoundTrip_ExactFieldValues(t *testing.T) {
+	tests := []struct {
+		name string
+		send *criteriav2.PermissionEvent
+	}{
+		{
+			name: "request carries all PermissionRequest fields",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_Request{
+				Request: &criteriav2.PermissionRequest{
+					RequestId:   "req-1",
+					Tool:        "create_issue",
+					ArgsDigest:  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+					ArgsPreview: `{"title":"Found a bug"}`,
+				},
+			}},
+		},
+		{
+			name: "cancel carries both PermissionCancel fields",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_Cancel{
+				Cancel: &criteriav2.PermissionCancel{
+					RequestId: "req-2",
+					Reason:    "no matching allow_tools entry",
+				},
+			}},
+		},
+		{
+			name: "tool_call_result success, unchunked",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_ToolCallResult{
+				ToolCallResult: &criteriav2.ToolCallResult{
+					RequestId:   "call-1",
+					Outcome:     "success",
+					OutputsJson: []byte(`{"issue_url":"https://github.com/octocat/hello-world/issues/1","number":1}`),
+				},
+			}},
+		},
+		{
+			name: "tool_call_result success, mid-stream chunk fragment",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_ToolCallResult{
+				ToolCallResult: &criteriav2.ToolCallResult{
+					RequestId:   "call-1",
+					Outcome:     "success",
+					Chunk:       &criteriav2.Chunk{Seq: 1, Total: 3, Final: false},
+					OutputsJson: []byte(`ue":"https://github.com/octocat/hello-world/issues/1"`),
+				},
+			}},
+		},
+		{
+			name: "tool_call_result typed failure",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_ToolCallResult{
+				ToolCallResult: &criteriav2.ToolCallResult{
+					RequestId: "call-2",
+					CallError: "callee_timeout",
+				},
+			}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := roundTrip(t, tc.send)
+
+			// The exact member that was sent survives; its siblings do not.
+			switch want := tc.send.Event.(type) {
+			case *criteriav2.PermissionEvent_Request:
+				assert.Nil(t, got.GetCancel(), "cancel must not be set")
+				assert.Nil(t, got.GetToolCallResult(), "tool_call_result must not be set")
+				gotReq := got.GetRequest()
+				require.NotNil(t, gotReq, "request member must survive the round trip")
+				assert.Equal(t, want.Request.RequestId, gotReq.RequestId)
+				assert.Equal(t, want.Request.Tool, gotReq.Tool)
+				assert.Equal(t, want.Request.ArgsDigest, gotReq.ArgsDigest)
+				assert.Equal(t, want.Request.ArgsPreview, gotReq.ArgsPreview)
+			case *criteriav2.PermissionEvent_Cancel:
+				assert.Nil(t, got.GetRequest(), "request must not be set")
+				assert.Nil(t, got.GetToolCallResult(), "tool_call_result must not be set")
+				gotCancel := got.GetCancel()
+				require.NotNil(t, gotCancel, "cancel member must survive the round trip")
+				assert.Equal(t, want.Cancel.RequestId, gotCancel.RequestId)
+				assert.Equal(t, want.Cancel.Reason, gotCancel.Reason)
+			case *criteriav2.PermissionEvent_ToolCallResult:
+				assert.Nil(t, got.GetRequest(), "request must not be set")
+				assert.Nil(t, got.GetCancel(), "cancel must not be set")
+				gotRes := got.GetToolCallResult()
+				require.NotNil(t, gotRes, "tool_call_result member must survive the round trip")
+				assert.Equal(t, want.ToolCallResult.RequestId, gotRes.RequestId)
+				assert.Equal(t, want.ToolCallResult.Outcome, gotRes.Outcome)
+				assert.Equal(t, want.ToolCallResult.CallError, gotRes.CallError)
+				assert.Equal(t, want.ToolCallResult.OutputsJson, gotRes.OutputsJson)
+				if want.ToolCallResult.Chunk == nil {
+					assert.Nil(t, gotRes.Chunk, "chunk must stay nil when sent unset")
+				} else {
+					require.NotNil(t, gotRes.Chunk, "chunk must survive the round trip")
+					assert.Equal(t, want.ToolCallResult.Chunk.Seq, gotRes.Chunk.Seq)
+					assert.Equal(t, want.ToolCallResult.Chunk.Total, gotRes.Chunk.Total)
+					assert.Equal(t, want.ToolCallResult.Chunk.Final, gotRes.Chunk.Final)
+				}
+			default:
+				t.Fatalf("unhandled oneof member %T", tc.send.Event)
+			}
+		})
+	}
+}
+
 func TestPermissionDecision_RoundTrip(t *testing.T) {
 	msg := &criteriav2.PermissionDecision{
 		RequestId: "req-1",

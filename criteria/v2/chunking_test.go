@@ -416,6 +416,71 @@ func TestJoinToolCallResultOutputs_FramingValidation(t *testing.T) {
 	}
 }
 
+// TestChunkToolCallResultOutputs_OversizeContract pins the size contract of
+// the tool-call result chunking path, mirroring the ExecuteResult chunk
+// tests: outputs over the negotiated limit are detected by NeedsChunking and
+// split into fragments that each fit the limit and reassemble to the
+// original payload; outputs at the limit stay a single final chunk; and a
+// receiver handed an oversize declared total (more chunks declared than
+// delivered) fails reassembly instead of waiting for chunks that never
+// arrive or returning truncated data.
+func TestChunkToolCallResultOutputs_OversizeContract(t *testing.T) {
+	const negotiatedMax = uint32(32)
+	base := &criteriav2.ToolCallResult{RequestId: "call-1", Outcome: "success"}
+
+	t.Run("oversize outputs split into fragments within the limit", func(t *testing.T) {
+		outputs := bytes.Repeat([]byte("a"), int(negotiatedMax)+1) // one byte over
+		require.True(t, criteriav2.NeedsChunking(outputs, negotiatedMax),
+			"outputs over the negotiated limit must require chunking")
+
+		fragments := criteriav2.ChunkToolCallResultOutputs(base, outputs, negotiatedMax)
+		require.Len(t, fragments, 2, "one byte over the limit must split into two fragments")
+		for i, frag := range fragments {
+			require.NotNilf(t, frag.Chunk, "fragment[%d] must carry framing", i)
+			assert.LessOrEqualf(t, len(frag.OutputsJson), int(negotiatedMax),
+				"fragment[%d] payload must fit the negotiated limit", i)
+			assert.Equalf(t, uint32(i), frag.Chunk.Seq, "fragment[%d] seq", i)
+			assert.Equalf(t, uint32(len(fragments)), frag.Chunk.Total, "fragment[%d] total", i)
+			assert.Equalf(t, i == len(fragments)-1, frag.Chunk.Final, "fragment[%d] final flag", i)
+			assert.Equalf(t, base.RequestId, frag.RequestId, "fragment[%d] request_id", i)
+		}
+
+		joined, err := criteriav2.JoinToolCallResultOutputs(fragments)
+		require.NoError(t, err)
+		assert.Equal(t, outputs, joined, "reassembly must reproduce the oversize outputs")
+	})
+
+	t.Run("outputs at the negotiated limit stay one final chunk", func(t *testing.T) {
+		outputs := bytes.Repeat([]byte("b"), int(negotiatedMax))
+		assert.False(t, criteriav2.NeedsChunking(outputs, negotiatedMax),
+			"outputs at the negotiated limit must not require chunking")
+
+		fragments := criteriav2.ChunkToolCallResultOutputs(base, outputs, negotiatedMax)
+		require.Len(t, fragments, 1)
+		assert.True(t, fragments[0].Chunk.Final)
+		assert.Equal(t, uint32(1), fragments[0].Chunk.Total)
+
+		joined, err := criteriav2.JoinToolCallResultOutputs(fragments)
+		require.NoError(t, err)
+		assert.Equal(t, outputs, joined)
+	})
+
+	t.Run("oversize declared total fails reassembly", func(t *testing.T) {
+		// Three chunks declared, two delivered: the receiver must fail
+		// reassembly instead of waiting for the missing chunk or returning
+		// truncated outputs.
+		fragments := []*criteriav2.ToolCallResult{
+			{RequestId: base.RequestId, Outcome: base.Outcome,
+				Chunk: &criteriav2.Chunk{Seq: 0, Total: 3, Final: false}, OutputsJson: []byte("aa")},
+			{RequestId: base.RequestId, Outcome: base.Outcome,
+				Chunk: &criteriav2.Chunk{Seq: 1, Total: 3, Final: true}, OutputsJson: []byte("b")},
+		}
+		_, err := criteriav2.JoinToolCallResultOutputs(fragments)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "declares total 3 chunks but 2 were given")
+	})
+}
+
 // sliceChunkSink is a test-only ChunkSink that captures envelopes.
 type sliceChunkSink struct {
 	envelopes []*criteriav2.ChunkEnvelope
