@@ -1,0 +1,204 @@
+// Criteria Adapter Supervision Protocol v1.
+//
+// AdapterSupervision is the criteria-to-criteria semantic supervision channel
+// for remote adapters running behind a byte-tunnel shim. The adapter-side
+// supervisor reports typed process facts (spawn, exit, crash class, stream
+// flush, heartbeat) over ReportSupervision, and the host answers with flow
+// acks. Control carries host-initiated ops (kill, respawn, detach) — the HOST
+// is the gRPC client there so it can initiate ops; the adapter answers each
+// with an applied/rejected ControlEvent. Attach is the reconnect rendezvous:
+// after a dropped connection the host re-attaches with the last event_seq it
+// applied and the adapter answers with a bounded journal replay point, session
+// liveness, and the current lease.
+//
+// Contract:
+//
+//   - SupervisionAck / ControlApplied / lease renewals are FLOW SIGNALS on a
+//     live stream; nothing is durable until session completes; a dropped
+//     connection forces Attach + bounded journal replay.
+//   - event_seq is monotonic per session_id, assigned by the emitter;
+//     ReportSupervision and ControlEvent share ONE sequence space per session
+//     (one emitter, one sequence); receivers dedup on (session_id, event_seq).
+//   - Crash classification and exit codes are computed adapter-side (where
+//     ProcessExited is reachable) and shipped as facts; the host must never
+//     string-match transport errors for supervised sessions.
+//
+// This file is the wire contract only; generated Go bindings land in
+// criteria/v2 via follow-on tickets.
+syntax = "proto3";
+
+package criteria.v2;
+
+import "criteria/v2/adapter.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/brokenbots/criteria-adapter-proto/criteria/v2;criteriav2";
+
+// AdapterSupervision is the supervision contract between the host and a
+// remote adapter process.
+service AdapterSupervision {
+  rpc ReportSupervision(stream SupervisionEvent) returns (stream SupervisionAck);
+  rpc Control(stream ControlEvent) returns (stream ControlRequest);
+  rpc Attach(AttachRequest) returns (AttachResponse);
+}
+
+// ─── Supervision events ──────────────────────────────────────────────────────
+
+// SupervisionEvent is the stream message for ReportSupervision. The adapter
+// is the emitter: it assigns event_seq (monotonic per session_id, shared with
+// ControlEvent) and heartbeats when no other event is flowing.
+message SupervisionEvent {
+  string session_id = 1;
+  uint64 event_seq = 2;
+  google.protobuf.Timestamp at = 3;
+  oneof kind {
+    ProcessSpawned spawned = 4;
+    ProcessExited exited = 5;
+    CrashClassified crash = 6;
+    StreamFlushed flushed = 7;
+    Heartbeat heartbeat = 8;
+  }
+  reserved 100 to 999;
+}
+
+// ProcessSpawned reports a successful spawn of the supervised process.
+//
+// generation is 1 on the first spawn and +1 per respawn, so receivers can
+// correlate the full lifecycle of one session's process chain.
+message ProcessSpawned {
+  int64 pid = 1;
+  string binary = 2;
+  string digest = 3;
+  uint32 generation = 4;
+  reserved 100 to 999;
+}
+
+// ProcessExited reports the observed termination of a spawned process. The
+// classification of whether that exit is a crash belongs to CrashClassified;
+// this message ships the raw facts.
+message ProcessExited {
+  int64 pid = 1;
+  int32 exit_code = 2;
+  string signal = 3;
+  int64 idle_ms = 4;
+  uint32 generation = 5;
+  reserved 100 to 999;
+}
+
+// CrashClassified reports the adapter-side crash classification for a
+// supervision event.
+//
+// reason is drawn from a closed registry:
+//
+//   "process_exited" | "spawn_failed" | "heartbeat_stall" |
+//   "agent_shutdown" | "killed_by_host" | "unknown"
+//
+// detail carries the unclassified, human-readable context behind the reason.
+message CrashClassified {
+  string reason = 1;
+  string detail = 2;
+  uint32 generation = 3;
+  reserved 100 to 999;
+}
+
+// StreamFlushed reports that a stream was flushed through a sequence.
+message StreamFlushed {
+  string stream_name = 1;
+  uint64 through_seq = 2;
+  reserved 100 to 999;
+}
+
+// SupervisionAck is the host-to-adapter flow signal on ReportSupervision:
+// last_applied_seq tells the emitter how far its journal has been consumed.
+message SupervisionAck {
+  uint64 last_applied_seq = 1;
+  reserved 100 to 999;
+}
+
+// ─── Control ops ─────────────────────────────────────────────────────────────
+
+// ControlRequest is a host-initiated op streamed to the adapter on Control.
+message ControlRequest {
+  string session_id = 1;
+  oneof op {
+    Kill kill = 2;
+    Respawn respawn = 3;
+    Detach detach = 4;
+    Heartbeat heartbeat = 5;
+  }
+  reserved 100 to 999;
+}
+
+// Kill requests termination of the supervised process.
+message Kill {
+  string reason = 1;
+  reserved 100 to 999;
+}
+
+// Respawn requests a new process generation for the session.
+message Respawn {
+  string reason = 1;
+  reserved 100 to 999;
+}
+
+// Detach requests that the adapter carry the session under a lease without
+// an attached host, for lease_seconds.
+message Detach {
+  int64 lease_seconds = 1;
+  reserved 100 to 999;
+}
+
+// ─── Control results ─────────────────────────────────────────────────────────
+
+// ControlEvent is the host-to-adapter result stream on Control: every
+// ControlRequest op is answered applied or rejected, and the host heartbeats
+// when no result is pending.
+message ControlEvent {
+  string session_id = 1;
+  uint64 event_seq = 2;
+  oneof kind {
+    ControlApplied applied = 3;
+    ControlRejected rejected = 4;
+    Heartbeat heartbeat = 5;
+  }
+  reserved 100 to 999;
+}
+
+// ControlApplied confirms a ControlRequest op was applied.
+message ControlApplied {
+  string op = 1;
+  string detail = 2;
+  reserved 100 to 999;
+}
+
+// ControlRejected reports a ControlRequest op the adapter refused.
+message ControlRejected {
+  string op = 1;
+  string reason = 2;
+  reserved 100 to 999;
+}
+
+// ─── Attach ──────────────────────────────────────────────────────────────────
+
+// AttachRequest re-establishes supervision after a dropped connection. The
+// host presents the last event_seq it applied plus the reattach token and the
+// adapter digest it expects to talk to.
+message AttachRequest {
+  string session_id = 1;
+  uint64 last_seen_event_seq = 2;
+  string token = 3;
+  string adapter_digest = 4;
+  reserved 100 to 999;
+}
+
+// AttachResponse answers Attach: resume_from_seq is where the bounded journal
+// replay starts, session_alive reports whether the supervised session is
+// still running, and lease_seconds carries the lease (default 90, matching
+// the log-stream heartbeat stall semantics).
+message AttachResponse {
+  uint64 resume_from_seq = 1;
+  bool session_alive = 2;
+  uint32 lease_seconds = 3;
+  reserved 100 to 999;
+}

@@ -15,6 +15,10 @@ lint:
     - RPC_REQUEST_STANDARD_NAME
     - RPC_RESPONSE_STANDARD_NAME
     - RPC_REQUEST_RESPONSE_UNIQUE
+    # AdapterSupervision (proto/criteria/v2/supervision.proto) is the
+    # design-gated service name for the supervision channel; it is kept
+    # despite the Service suffix convention.
+    - SERVICE_SUFFIX
     # Skip docstring enforcement; schema is documented in docs/ and inline.
     - COMMENT_ENUM
     - COMMENT_MESSAGE
