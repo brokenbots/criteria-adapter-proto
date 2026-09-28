@@ -145,6 +145,16 @@ message InfoResponse {
   // large tools list is acceptable but adapters should keep descriptions
   // short — the list multiplies across every handshake.
   repeated ToolInfo tools = 17; // NEW v2 (CRI-171)
+  // state declares the adapter's checkpointable session-state surface, so the
+  // host can decide when and where to save/restore that state (CRI-201).
+  // The declaration is ENGINE/SDK surface only: it carries NO checkpoint
+  // semantics in any backing store — blob payloads flow to the engine's
+  // store through the engine, and ref-mode adapters point at their own
+  // stores.  Absent = mode "none": adapters without a declaration behave
+  // exactly as before, a fresh start on every (re)spawn.  InfoResponse is
+  // sent at every handshake and re-verification, so the declaration travels
+  // with every relaunch.
+  StateDescriptor state = 18; // NEW v2 (CRI-201)
   reserved 100 to 999;
 }
 
@@ -159,6 +169,47 @@ message ToolInfo {
   // schema system; do not build validation on it.  Empty/unset when the
   // tool takes no arguments or the adapter does not know the shape.
   optional string args_schema_json = 3;
+  reserved 100 to 999;
+}
+
+// StateDescriptor declares how the adapter's checkpointable session state is
+// stored, so the host can decide when and where to save/restore it (CRI-201).
+// Absent (or mode "none") = today's behavior: a fresh start on every
+// (re)spawn.  The declaration travels in InfoResponse.state at every
+// handshake; hosts and adapters without checkpoint support simply ignore it
+// (unknown fields preserved on the wire).
+message StateDescriptor {
+  // mode declares where checkpointable state lives.  Well-known values:
+  //
+  //   none — no checkpointable state; a fresh start on every (re)spawn
+  //          (default; identical to an absent descriptor).
+  //   blob — the host stores the serialized state object on the adapter's
+  //          behalf (the engine's backing store via the engine; the store
+  //          provides storage primitives only).
+  //   ref  — state is an opaque token to ADAPTER-OWNED state (e.g. a
+  //          harness session id); the host persists the token, never the
+  //          payload.
+  //
+  // Unknown values are NOT silently downgraded: an adapter that declares a
+  // mode the host does not implement must fail the handshake LOUDLY,
+  // because quietly treating an unrecognized mode as "none" would silently
+  // drop checkpointing for a stateful adapter.
+  string mode = 1;
+  // schema is the adapter-defined version tag of the serialized state shape.
+  // It travels with every saved state so a restore can reject a mismatched
+  // shape instead of misinterpreting the bytes.  Required for blob/ref.
+  string schema = 2;
+  // max_bytes is the adapter-declared cap on a single saved state object.
+  // 0 = use the host default (~400 KiB).  A save that would exceed the cap
+  // FAILS the save loudly and fails the step — it is never truncated (a
+  // truncated transcript restores as a plausible-looking broken session,
+  // the worst failure class).
+  uint32 max_bytes = 3;
+  // granularity declares when the adapter expects its state to be saved.
+  // Well-known values: "per-step" | "per-turn" | "on-demand".  Unknown
+  // values are ignored for forward-compatibility; the host falls back to
+  // its own default save policy.
+  string granularity = 4;
   reserved 100 to 999;
 }
 
