@@ -156,6 +156,73 @@ func TestInfoResponse_Tools_WireFieldNumbers(t *testing.T) {
 		"args_schema_json must be explicitly optional (presence-tracking)")
 }
 
+// TestInfoResponse_State_RoundTrip asserts the CRI-201 checkpoint contract:
+// InfoResponse.state carries a StateDescriptor (mode, schema, max_bytes,
+// granularity) and it survives the proto wire round-trip unchanged.  An
+// absent descriptor must stay absent (adapters without a declaration behave
+// exactly as before — mode "none"), and all three modes plus an unknown
+// future mode value are free-form strings that must round-trip byte-faithfully.
+func TestInfoResponse_State_RoundTrip(t *testing.T) {
+	blob := &criteriav2.InfoResponse{
+		Name:    "transcript-adapter",
+		Version: "1.0.0",
+		State: &criteriav2.StateDescriptor{
+			Mode:        "blob",
+			Schema:      "transcript.v1",
+			MaxBytes:    400 * 1024,
+			Granularity: "per-turn",
+		},
+	}
+	got := roundTrip(t, blob)
+	require.True(t, proto.Equal(blob, got))
+	require.NotNil(t, got.State, "a declared state must survive the wire")
+	assert.Equal(t, "blob", got.State.GetMode())
+	assert.Equal(t, "transcript.v1", got.State.GetSchema(),
+		"schema is the adapter-defined version tag and must round-trip byte-faithfully")
+	assert.Equal(t, uint32(400*1024), got.State.GetMaxBytes())
+	assert.Equal(t, "per-turn", got.State.GetGranularity())
+
+	for _, mode := range []string{"", "none", "ref", "some_future_mode_xyz"} {
+		msg := &criteriav2.InfoResponse{State: &criteriav2.StateDescriptor{Mode: mode}}
+		got := roundTrip(t, msg)
+		require.True(t, proto.Equal(msg, got), "mode %q must round-trip unchanged", mode)
+	}
+
+	absent := roundTrip(t, &criteriav2.InfoResponse{Name: "bare"})
+	assert.Nil(t, absent.GetState(),
+		"an absent declaration must stay absent — mode none is today's behavior")
+}
+
+// TestInfoResponse_State_WireFieldNumbers pins the CRI-201 wire contract:
+// InfoResponse.state is field 18 (immediately after tools=17), and
+// StateDescriptor carries mode(1), schema(2), max_bytes(3), granularity(4).
+// The field must land on the wire BEFORE the engine starts consuming the
+// declaration for checkpointing (CRI-202), so these numbers are part of the
+// contract.
+func TestInfoResponse_State_WireFieldNumbers(t *testing.T) {
+	fd := criteriav2.File_criteria_v2_adapter_proto
+	require.NotNil(t, fd, "adapter proto descriptor must be registered")
+
+	infoDesc := fd.Messages().ByName("InfoResponse")
+	require.NotNil(t, infoDesc)
+	state := infoDesc.Fields().ByName("state")
+	require.NotNil(t, state, "InfoResponse.state must exist on the wire")
+	assert.Equal(t, protoreflect.FieldNumber(18), state.Number(), "InfoResponse.state must be field 18")
+	assert.True(t, state.HasPresence(),
+		"InfoResponse.state must be an optional message field (presence-tracking)")
+	tools := infoDesc.Fields().ByName("tools")
+	require.NotNil(t, tools)
+	assert.Equal(t, protoreflect.FieldNumber(17), tools.Number(),
+		"state must be the next free field after tools")
+
+	descDesc := fd.Messages().ByName("StateDescriptor")
+	require.NotNil(t, descDesc)
+	assert.Equal(t, protoreflect.FieldNumber(1), descDesc.Fields().ByName("mode").Number())
+	assert.Equal(t, protoreflect.FieldNumber(2), descDesc.Fields().ByName("schema").Number())
+	assert.Equal(t, protoreflect.FieldNumber(3), descDesc.Fields().ByName("max_bytes").Number())
+	assert.Equal(t, protoreflect.FieldNumber(4), descDesc.Fields().ByName("granularity").Number())
+}
+
 // TestInfoResponse_Capabilities_AdapterTools_RoundTrip asserts the CRI-153
 // capability vocabulary: adapters declare tool-call support with the
 // "adapter_tools" capability string in InfoResponse.capabilities, and the
