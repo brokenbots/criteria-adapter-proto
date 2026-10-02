@@ -88,7 +88,7 @@ func EvaluateOutcomeContracts(req *ExecuteRequest, results []*ExecuteResult) (*E
 	var issues []string
 	if contract.GetRequireComment() && r.GetComment() == "" {
 		issues = append(issues, fmt.Sprintf(
-			"missing_comment: outcome %q requires a comment (require_comment)", name))
+			"missing_comment: outcome \"%s\" requires a comment (require_comment)", name))
 	}
 	if schema := contract.GetSchemaJson(); len(schema) > 0 {
 		issues = append(issues, ValidatePayloadSchema(schema, r.GetOutputsJson())...)

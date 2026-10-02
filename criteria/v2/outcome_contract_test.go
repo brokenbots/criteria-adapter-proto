@@ -234,6 +234,25 @@ func TestEvaluateOutcomeContracts_IssueOrdering(t *testing.T) {
 	}, issues)
 }
 
+// TestEvaluateOutcomeContracts_MissingCommentLiteralQuotes pins that the
+// parameterized issue strings use literal double quotes (NOT language-native
+// quoting like Go's %q): outcome names go through byte-identical assembly in
+// every SDK, so a name carrying a quote or non-ASCII rune must surface
+// verbatim, never escaped.
+func TestEvaluateOutcomeContracts_MissingCommentLiteralQuotes(t *testing.T) {
+	req := contractModeReq([]*criteriav2.OutcomeContract{{
+		Name:           `weird"name é`,
+		RequireComment: true,
+	}}, `weird"name é`)
+	got, issues := criteriav2.EvaluateOutcomeContracts(req, []*criteriav2.ExecuteResult{
+		{Outcome: `weird"name é`},
+	})
+	require.Nil(t, got)
+	require.Equal(t, []string{
+		`missing_comment: outcome "weird"name é" requires a comment (require_comment)`,
+	}, issues)
+}
+
 // TestNewExecutionRejection pins the repair-backstop construction: issues are
 // joined with "\n" and the attempt counter increments the prior attempt,
 // starting at 1 on a fresh step (no prior rejection).
