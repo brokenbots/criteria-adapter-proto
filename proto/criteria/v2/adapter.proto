@@ -245,12 +245,117 @@ message CloseSessionResponse {
 
 // ─── Execute ─────────────────────────────────────────────────────────────────
 
+// OutcomeContract declares the per-outcome payload contract enforced on a
+// step's finalize (v0.7.0, outcome-contract wave). It is a per-step,
+// Execute-scoped artifact: contracts ride ExecuteRequest ONLY, never
+// OpenSessionRequest — they are per-step and Execute already carries the
+// per-step allowed_outcomes. Restore/Pause/Resume need no changes: a resumed
+// session receives the contracts again on its next Execute.
+//
+// Contract mode is per-execute: when ExecuteRequest.outcome_contracts is
+// non-empty the finalized ExecuteResult is validated against these contracts;
+// when it is empty the step behaves exactly as it did before v0.7.0 (see the
+// ExecuteRequest.outcome_contracts comment for the full mode rules).
+//
+// Enforcement is split:
+//
+//   - adapter-side (in-session): the adapter validates the model-submitted
+//     payload against schema_json BEFORE finalizing; a rejected payload
+//     is surfaced as the outcome.payload_invalid AdapterEvent with the issue
+//     list (see docs/adapters.md), never silently forwarded.
+//   - host-side (post-finalize): the host re-validates the returned
+//     ExecuteResult and, on failure, retries via the standard attempt loop;
+//     the next Execute carries an ExecutionRejection (see that message).
+//
+// Large payloads keep the existing framing: outputs_json chunking applies to
+// contract-mode payloads exactly as before; contract mode introduces NO new
+// framing.
+message OutcomeContract {
+  // name is the outcome this contract governs; it must match an
+  // allowed_outcomes entry while the host still populates that list (see the
+  // ExecuteRequest.allowed_outcomes / outcome_contracts comments for the
+  // deprecation cycle).
+  string name = 1;
+  // schema_json is the JSON Schema the outcome's payload (the JSON object in
+  // ExecuteResult.outputs_json) must satisfy; empty = the outcome carries no
+  // payload contract and its outputs_json is forwarded verbatim. The
+  // in-repo conformance vectors restrict schemas to the pinned subset
+  // documented in conformance/README.md; full JSON Schema is a host's
+  // compile-time choice, not a wire-contract concern.
+  bytes schema_json = 2;
+  // fallback marks this contract as the no-finalize fallback outcome: the
+  // host finalizes with it when a step ends without any finalization. The
+  // host enforces AT MOST ONE fallback contract per step at compile time;
+  // more than one fallback is a compile error. The fallback finalize carries
+  // no payload and no comment regardless of the contract's other settings.
+  bool fallback = 3;
+  // require_comment makes the finalize comment (ExecuteResult.comment)
+  // mandatory when finalizing with this outcome: an empty comment is
+  // rejected with an issue instead of forwarded.
+  bool require_comment = 4;
+  reserved 100 to 999;
+}
+
+// ExecutionRejection carries the host-side context of a rejected ExecuteResult
+// back to the adapter on the NEXT Execute (v0.7.0, dave-approved repair
+// backstop). When the host invalidates the adapter's returned result
+// (unknown outcome, schema-invalid payload, missing mandatory comment), the
+// host retries via the standard attempt loop and the next Execute describes
+// the rejection.
+//
+// Empty rejection = a normal execute: run the full step prompt. Non-empty
+// rejection = repair mode: skip the full step prompt, send a minimal repair
+// prompt into the SAME live session, and resubmit a corrected payload
+// (corrected outcome/comment/outputs).
+message ExecutionRejection {
+  // outcome is the rejected result's outcome name; empty when the result
+  // carried no recognizable outcome.
+  string outcome = 1;
+  // issues is the human-readable description of what the host rejected. It
+  // is diagnostic text intended to be quoted into the repair prompt; it is
+  // NOT a machine contract and adapters must not parse it.
+  string issues = 2;
+  // attempt is the 1-based repair-attempt counter: the first re-execute
+  // after a rejection carries attempt=1, the next attempt=2. It increments
+  // within a step's retry loop; a fresh step starts from an empty rejection.
+  uint32 attempt = 3;
+  reserved 100 to 999;
+}
+
 message ExecuteRequest {
   string session_id = 1;
   string step_name = 2;
   map<string, string> input = 3;
   map<string, string> secret_inputs = 4 [(criteria.v2.sensitive) = true];
   repeated string allowed_outcomes = 5;
+  // outcome_contracts activates contract mode for this single Execute.
+  //
+  // Mode rules (v0.7.0):
+  //
+  //   - Empty outcome_contracts = today's behavior byte-for-byte: name-only
+  //     validation against allowed_outcomes, no payload contract.
+  //   - Non-empty outcome_contracts = contract mode: outputs_json MUST be
+  //     exactly the model-submitted, schema-validated payload — NOT a
+  //     session-state assembly. allowed_outcomes name validation still
+  //     applies (the outcome must be an allowed name even in contract mode).
+  //   - allowed_outcomes stays populated through one deprecation cycle so
+  //     the cross-version matrix works: old adapter + new host works (old
+  //     adapters keep name-only behavior and the host still name-checks);
+  //     new adapter + old host degrades to name-only validation (the old
+  //     adapter/host pair never sees contracts — old hosts receive
+  //     outcome_contracts as unknown fields which their generated code
+  //     ignores). After the cycle, hosts MAY stop populating
+  //     allowed_outcomes for contract-mode steps; the deprecation counts
+  //     from the v0.7.0 release.
+  //   - Contract mode adds NO new framing: large payloads are chunked on
+  //     outputs_json exactly as before.
+  //   - rejection is the host-rejection repair backstop (see
+  //     ExecutionRejection): v0.7.0 hosts populate it on re-execute; hosts
+  //     and adapters predating v0.7.0 see neither field.
+  repeated OutcomeContract outcome_contracts = 6;
+  // rejection carries the previous attempt's rejection context; absent (nil)
+  // = normal execute, non-empty = repair mode (see ExecutionRejection).
+  ExecutionRejection rejection = 7;
   reserved 100 to 999;
 }
 
@@ -299,6 +404,14 @@ message ExecuteResult {
   // all fragments in Chunk.seq order and concatenate before decoding; when chunk
   // is nil, outputs_json is the whole object in one message.
   bytes outputs_json = 4;
+  // comment is the finalize comment the model/adapter produced for this
+  // outcome — first-class wire metadata as of v0.7.0. Until now it survived
+  // only in adapter event payloads (e.g. the outcome.finalized AdapterEvent's
+  // "reason" value); carrying it here lets contract mode enforce
+  // require_comment and lets hosts surface the comment to operators without
+  // scraping events. Empty = no comment; contract mode rejects an empty
+  // comment when the outcome's contract sets require_comment.
+  string comment = 5;
   // Field 2 was the legacy map<string,string> outputs channel, removed in the
   // v2 typed-outputs cutover. Do not reuse.
   reserved 2;
