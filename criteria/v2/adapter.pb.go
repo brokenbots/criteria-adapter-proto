@@ -900,6 +900,196 @@ func (*CloseSessionResponse) Descriptor() ([]byte, []int) {
 	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{11}
 }
 
+// OutcomeContract declares the per-outcome payload contract enforced on a
+// step's finalize (v0.7.0, outcome-contract wave). It is a per-step,
+// Execute-scoped artifact: contracts ride ExecuteRequest ONLY, never
+// OpenSessionRequest — they are per-step and Execute already carries the
+// per-step allowed_outcomes. Restore/Pause/Resume need no changes: a resumed
+// session receives the contracts again on its next Execute.
+//
+// Contract mode is per-execute: when ExecuteRequest.outcome_contracts is
+// non-empty the finalized ExecuteResult is validated against these contracts;
+// when it is empty the step behaves exactly as it did before v0.7.0 (see the
+// ExecuteRequest.outcome_contracts comment for the full mode rules).
+//
+// Enforcement is split:
+//
+//   - adapter-side (in-session): the adapter validates the model-submitted
+//     payload against schema_json BEFORE finalizing; a rejected payload
+//     is surfaced as the outcome.payload_invalid AdapterEvent with the issue
+//     list (see docs/adapters.md), never silently forwarded.
+//   - host-side (post-finalize): the host re-validates the returned
+//     ExecuteResult and, on failure, retries via the standard attempt loop;
+//     the next Execute carries an ExecutionRejection (see that message).
+//
+// Large payloads keep the existing framing: outputs_json chunking applies to
+// contract-mode payloads exactly as before; contract mode introduces NO new
+// framing.
+type OutcomeContract struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// name is the outcome this contract governs; it must match an
+	// allowed_outcomes entry while the host still populates that list (see the
+	// ExecuteRequest.allowed_outcomes / outcome_contracts comments for the
+	// deprecation cycle).
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// schema_json is the JSON Schema the outcome's payload (the JSON object in
+	// ExecuteResult.outputs_json) must satisfy; empty = the outcome carries no
+	// payload contract and its outputs_json is forwarded verbatim. The
+	// in-repo conformance vectors restrict schemas to the pinned subset
+	// documented in conformance/README.md; full JSON Schema is a host's
+	// compile-time choice, not a wire-contract concern.
+	SchemaJson []byte `protobuf:"bytes,2,opt,name=schema_json,json=schemaJson,proto3" json:"schema_json,omitempty"`
+	// fallback marks this contract as the no-finalize fallback outcome: the
+	// host finalizes with it when a step ends without any finalization. The
+	// host enforces AT MOST ONE fallback contract per step at compile time;
+	// more than one fallback is a compile error. The fallback finalize carries
+	// no payload and no comment regardless of the contract's other settings.
+	Fallback bool `protobuf:"varint,3,opt,name=fallback,proto3" json:"fallback,omitempty"`
+	// require_comment makes the finalize comment (ExecuteResult.comment)
+	// mandatory when finalizing with this outcome: an empty comment is
+	// rejected with an issue instead of forwarded.
+	RequireComment bool `protobuf:"varint,4,opt,name=require_comment,json=requireComment,proto3" json:"require_comment,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *OutcomeContract) Reset() {
+	*x = OutcomeContract{}
+	mi := &file_criteria_v2_adapter_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OutcomeContract) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OutcomeContract) ProtoMessage() {}
+
+func (x *OutcomeContract) ProtoReflect() protoreflect.Message {
+	mi := &file_criteria_v2_adapter_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OutcomeContract.ProtoReflect.Descriptor instead.
+func (*OutcomeContract) Descriptor() ([]byte, []int) {
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *OutcomeContract) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *OutcomeContract) GetSchemaJson() []byte {
+	if x != nil {
+		return x.SchemaJson
+	}
+	return nil
+}
+
+func (x *OutcomeContract) GetFallback() bool {
+	if x != nil {
+		return x.Fallback
+	}
+	return false
+}
+
+func (x *OutcomeContract) GetRequireComment() bool {
+	if x != nil {
+		return x.RequireComment
+	}
+	return false
+}
+
+// ExecutionRejection carries the host-side context of a rejected ExecuteResult
+// back to the adapter on the NEXT Execute (v0.7.0, dave-approved repair
+// backstop). When the host invalidates the adapter's returned result
+// (unknown outcome, schema-invalid payload, missing mandatory comment), the
+// host retries via the standard attempt loop and the next Execute describes
+// the rejection.
+//
+// Empty rejection = a normal execute: run the full step prompt. Non-empty
+// rejection = repair mode: skip the full step prompt, send a minimal repair
+// prompt into the SAME live session, and resubmit a corrected payload
+// (corrected outcome/comment/outputs).
+type ExecutionRejection struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// outcome is the rejected result's outcome name; empty when the result
+	// carried no recognizable outcome.
+	Outcome string `protobuf:"bytes,1,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	// issues is the human-readable description of what the host rejected. It
+	// is diagnostic text intended to be quoted into the repair prompt; it is
+	// NOT a machine contract and adapters must not parse it.
+	Issues string `protobuf:"bytes,2,opt,name=issues,proto3" json:"issues,omitempty"`
+	// attempt is the 1-based repair-attempt counter: the first re-execute
+	// after a rejection carries attempt=1, the next attempt=2. It increments
+	// within a step's retry loop; a fresh step starts from an empty rejection.
+	Attempt       uint32 `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecutionRejection) Reset() {
+	*x = ExecutionRejection{}
+	mi := &file_criteria_v2_adapter_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecutionRejection) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecutionRejection) ProtoMessage() {}
+
+func (x *ExecutionRejection) ProtoReflect() protoreflect.Message {
+	mi := &file_criteria_v2_adapter_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecutionRejection.ProtoReflect.Descriptor instead.
+func (*ExecutionRejection) Descriptor() ([]byte, []int) {
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ExecutionRejection) GetOutcome() string {
+	if x != nil {
+		return x.Outcome
+	}
+	return ""
+}
+
+func (x *ExecutionRejection) GetIssues() string {
+	if x != nil {
+		return x.Issues
+	}
+	return ""
+}
+
+func (x *ExecutionRejection) GetAttempt() uint32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
+}
+
 type ExecuteRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	SessionId       string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -907,13 +1097,41 @@ type ExecuteRequest struct {
 	Input           map[string]string      `protobuf:"bytes,3,rep,name=input,proto3" json:"input,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	SecretInputs    map[string]string      `protobuf:"bytes,4,rep,name=secret_inputs,json=secretInputs,proto3" json:"secret_inputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	AllowedOutcomes []string               `protobuf:"bytes,5,rep,name=allowed_outcomes,json=allowedOutcomes,proto3" json:"allowed_outcomes,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// outcome_contracts activates contract mode for this single Execute.
+	//
+	// Mode rules (v0.7.0):
+	//
+	//   - Empty outcome_contracts = today's behavior byte-for-byte: name-only
+	//     validation against allowed_outcomes, no payload contract.
+	//   - Non-empty outcome_contracts = contract mode: outputs_json MUST be
+	//     exactly the model-submitted, schema-validated payload — NOT a
+	//     session-state assembly. allowed_outcomes name validation still
+	//     applies (the outcome must be an allowed name even in contract mode).
+	//   - allowed_outcomes stays populated through one deprecation cycle so
+	//     the cross-version matrix works: old adapter + new host works (old
+	//     adapters keep name-only behavior and the host still name-checks);
+	//     new adapter + old host degrades to name-only validation (the old
+	//     adapter/host pair never sees contracts — old hosts receive
+	//     outcome_contracts as unknown fields which their generated code
+	//     ignores). After the cycle, hosts MAY stop populating
+	//     allowed_outcomes for contract-mode steps; the deprecation counts
+	//     from the v0.7.0 release.
+	//   - Contract mode adds NO new framing: large payloads are chunked on
+	//     outputs_json exactly as before.
+	//   - rejection is the host-rejection repair backstop (see
+	//     ExecutionRejection): v0.7.0 hosts populate it on re-execute; hosts
+	//     and adapters predating v0.7.0 see neither field.
+	OutcomeContracts []*OutcomeContract `protobuf:"bytes,6,rep,name=outcome_contracts,json=outcomeContracts,proto3" json:"outcome_contracts,omitempty"`
+	// rejection carries the previous attempt's rejection context; absent (nil)
+	// = normal execute, non-empty = repair mode (see ExecutionRejection).
+	Rejection     *ExecutionRejection `protobuf:"bytes,7,opt,name=rejection,proto3" json:"rejection,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ExecuteRequest) Reset() {
 	*x = ExecuteRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[12]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -925,7 +1143,7 @@ func (x *ExecuteRequest) String() string {
 func (*ExecuteRequest) ProtoMessage() {}
 
 func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[12]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -938,7 +1156,7 @@ func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteRequest.ProtoReflect.Descriptor instead.
 func (*ExecuteRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{12}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ExecuteRequest) GetSessionId() string {
@@ -976,6 +1194,20 @@ func (x *ExecuteRequest) GetAllowedOutcomes() []string {
 	return nil
 }
 
+func (x *ExecuteRequest) GetOutcomeContracts() []*OutcomeContract {
+	if x != nil {
+		return x.OutcomeContracts
+	}
+	return nil
+}
+
+func (x *ExecuteRequest) GetRejection() *ExecutionRejection {
+	if x != nil {
+		return x.Rejection
+	}
+	return nil
+}
+
 // AdapterEvent is a typed semantic event emitted by the adapter.
 // event_kind is a dot-separated identifier; well-known values are registered
 // in docs/adapters.md (WS39).  Unknown kinds are forwarded unchanged.
@@ -1007,7 +1239,7 @@ type AdapterEvent struct {
 
 func (x *AdapterEvent) Reset() {
 	*x = AdapterEvent{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[13]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1019,7 +1251,7 @@ func (x *AdapterEvent) String() string {
 func (*AdapterEvent) ProtoMessage() {}
 
 func (x *AdapterEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[13]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1032,7 +1264,7 @@ func (x *AdapterEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdapterEvent.ProtoReflect.Descriptor instead.
 func (*AdapterEvent) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{13}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *AdapterEvent) GetEventKind() string {
@@ -1082,7 +1314,7 @@ type ToolInvocation struct {
 
 func (x *ToolInvocation) Reset() {
 	*x = ToolInvocation{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[14]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1094,7 +1326,7 @@ func (x *ToolInvocation) String() string {
 func (*ToolInvocation) ProtoMessage() {}
 
 func (x *ToolInvocation) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[14]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1107,7 +1339,7 @@ func (x *ToolInvocation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolInvocation.ProtoReflect.Descriptor instead.
 func (*ToolInvocation) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{14}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ToolInvocation) GetToolName() string {
@@ -1141,14 +1373,22 @@ type ExecuteResult struct {
 	// types — no jsondecode() needed in workflows. When chunk is non-nil, collect
 	// all fragments in Chunk.seq order and concatenate before decoding; when chunk
 	// is nil, outputs_json is the whole object in one message.
-	OutputsJson   []byte `protobuf:"bytes,4,opt,name=outputs_json,json=outputsJson,proto3" json:"outputs_json,omitempty"`
+	OutputsJson []byte `protobuf:"bytes,4,opt,name=outputs_json,json=outputsJson,proto3" json:"outputs_json,omitempty"`
+	// comment is the finalize comment the model/adapter produced for this
+	// outcome — first-class wire metadata as of v0.7.0. Until now it survived
+	// only in adapter event payloads (e.g. the outcome.finalized AdapterEvent's
+	// "reason" value); carrying it here lets contract mode enforce
+	// require_comment and lets hosts surface the comment to operators without
+	// scraping events. Empty = no comment; contract mode rejects an empty
+	// comment when the outcome's contract sets require_comment.
+	Comment       string `protobuf:"bytes,5,opt,name=comment,proto3" json:"comment,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ExecuteResult) Reset() {
 	*x = ExecuteResult{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[15]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1160,7 +1400,7 @@ func (x *ExecuteResult) String() string {
 func (*ExecuteResult) ProtoMessage() {}
 
 func (x *ExecuteResult) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[15]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1173,7 +1413,7 @@ func (x *ExecuteResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteResult.ProtoReflect.Descriptor instead.
 func (*ExecuteResult) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{15}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ExecuteResult) GetOutcome() string {
@@ -1197,6 +1437,13 @@ func (x *ExecuteResult) GetOutputsJson() []byte {
 	return nil
 }
 
+func (x *ExecuteResult) GetComment() string {
+	if x != nil {
+		return x.Comment
+	}
+	return ""
+}
+
 // ExecuteEvent is the stream message for the Execute RPC.
 // Log lines are NOT included here; they flow through the Log RPC.
 type ExecuteEvent struct {
@@ -1214,7 +1461,7 @@ type ExecuteEvent struct {
 
 func (x *ExecuteEvent) Reset() {
 	*x = ExecuteEvent{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[16]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1226,7 +1473,7 @@ func (x *ExecuteEvent) String() string {
 func (*ExecuteEvent) ProtoMessage() {}
 
 func (x *ExecuteEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[16]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1239,7 +1486,7 @@ func (x *ExecuteEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteEvent.ProtoReflect.Descriptor instead.
 func (*ExecuteEvent) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{16}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ExecuteEvent) GetEvent() isExecuteEvent_Event {
@@ -1323,7 +1570,7 @@ type LogRequest struct {
 
 func (x *LogRequest) Reset() {
 	*x = LogRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[17]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1335,7 +1582,7 @@ func (x *LogRequest) String() string {
 func (*LogRequest) ProtoMessage() {}
 
 func (x *LogRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[17]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1348,7 +1595,7 @@ func (x *LogRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogRequest.ProtoReflect.Descriptor instead.
 func (*LogRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{17}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *LogRequest) GetSessionId() string {
@@ -1389,7 +1636,7 @@ type LogEvent struct {
 
 func (x *LogEvent) Reset() {
 	*x = LogEvent{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[18]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1401,7 +1648,7 @@ func (x *LogEvent) String() string {
 func (*LogEvent) ProtoMessage() {}
 
 func (x *LogEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[18]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1414,7 +1661,7 @@ func (x *LogEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEvent.ProtoReflect.Descriptor instead.
 func (*LogEvent) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{18}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *LogEvent) GetSessionId() string {
@@ -1483,7 +1730,7 @@ type PermissionRequest struct {
 
 func (x *PermissionRequest) Reset() {
 	*x = PermissionRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1495,7 +1742,7 @@ func (x *PermissionRequest) String() string {
 func (*PermissionRequest) ProtoMessage() {}
 
 func (x *PermissionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[19]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1508,7 +1755,7 @@ func (x *PermissionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionRequest.ProtoReflect.Descriptor instead.
 func (*PermissionRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{19}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *PermissionRequest) GetRequestId() string {
@@ -1560,7 +1807,7 @@ type PermissionCancel struct {
 
 func (x *PermissionCancel) Reset() {
 	*x = PermissionCancel{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1572,7 +1819,7 @@ func (x *PermissionCancel) String() string {
 func (*PermissionCancel) ProtoMessage() {}
 
 func (x *PermissionCancel) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[20]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1585,7 +1832,7 @@ func (x *PermissionCancel) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionCancel.ProtoReflect.Descriptor instead.
 func (*PermissionCancel) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{20}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *PermissionCancel) GetRequestId() string {
@@ -1665,7 +1912,7 @@ type ToolCallResult struct {
 
 func (x *ToolCallResult) Reset() {
 	*x = ToolCallResult{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1677,7 +1924,7 @@ func (x *ToolCallResult) String() string {
 func (*ToolCallResult) ProtoMessage() {}
 
 func (x *ToolCallResult) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[21]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1690,7 +1937,7 @@ func (x *ToolCallResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCallResult.ProtoReflect.Descriptor instead.
 func (*ToolCallResult) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{21}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ToolCallResult) GetRequestId() string {
@@ -1774,7 +2021,7 @@ type PermissionEvent struct {
 
 func (x *PermissionEvent) Reset() {
 	*x = PermissionEvent{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1786,7 +2033,7 @@ func (x *PermissionEvent) String() string {
 func (*PermissionEvent) ProtoMessage() {}
 
 func (x *PermissionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[22]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1799,7 +2046,7 @@ func (x *PermissionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionEvent.ProtoReflect.Descriptor instead.
 func (*PermissionEvent) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{22}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PermissionEvent) GetEvent() isPermissionEvent_Event {
@@ -1880,7 +2127,7 @@ type PermissionDecision struct {
 
 func (x *PermissionDecision) Reset() {
 	*x = PermissionDecision{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1892,7 +2139,7 @@ func (x *PermissionDecision) String() string {
 func (*PermissionDecision) ProtoMessage() {}
 
 func (x *PermissionDecision) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[23]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1905,7 +2152,7 @@ func (x *PermissionDecision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionDecision.ProtoReflect.Descriptor instead.
 func (*PermissionDecision) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{23}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *PermissionDecision) GetRequestId() string {
@@ -1945,7 +2192,7 @@ type PauseRequest struct {
 
 func (x *PauseRequest) Reset() {
 	*x = PauseRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1957,7 +2204,7 @@ func (x *PauseRequest) String() string {
 func (*PauseRequest) ProtoMessage() {}
 
 func (x *PauseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[24]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1970,7 +2217,7 @@ func (x *PauseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseRequest.ProtoReflect.Descriptor instead.
 func (*PauseRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{24}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *PauseRequest) GetSessionId() string {
@@ -1988,7 +2235,7 @@ type PauseResponse struct {
 
 func (x *PauseResponse) Reset() {
 	*x = PauseResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2000,7 +2247,7 @@ func (x *PauseResponse) String() string {
 func (*PauseResponse) ProtoMessage() {}
 
 func (x *PauseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[25]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2013,7 +2260,7 @@ func (x *PauseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseResponse.ProtoReflect.Descriptor instead.
 func (*PauseResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{25}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{27}
 }
 
 type ResumeRequest struct {
@@ -2025,7 +2272,7 @@ type ResumeRequest struct {
 
 func (x *ResumeRequest) Reset() {
 	*x = ResumeRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2037,7 +2284,7 @@ func (x *ResumeRequest) String() string {
 func (*ResumeRequest) ProtoMessage() {}
 
 func (x *ResumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[26]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2050,7 +2297,7 @@ func (x *ResumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeRequest.ProtoReflect.Descriptor instead.
 func (*ResumeRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{26}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ResumeRequest) GetSessionId() string {
@@ -2068,7 +2315,7 @@ type ResumeResponse struct {
 
 func (x *ResumeResponse) Reset() {
 	*x = ResumeResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2080,7 +2327,7 @@ func (x *ResumeResponse) String() string {
 func (*ResumeResponse) ProtoMessage() {}
 
 func (x *ResumeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[27]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2093,7 +2340,7 @@ func (x *ResumeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeResponse.ProtoReflect.Descriptor instead.
 func (*ResumeResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{27}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{29}
 }
 
 type SnapshotRequest struct {
@@ -2105,7 +2352,7 @@ type SnapshotRequest struct {
 
 func (x *SnapshotRequest) Reset() {
 	*x = SnapshotRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2117,7 +2364,7 @@ func (x *SnapshotRequest) String() string {
 func (*SnapshotRequest) ProtoMessage() {}
 
 func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[28]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2130,7 +2377,7 @@ func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{28}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *SnapshotRequest) GetSessionId() string {
@@ -2150,7 +2397,7 @@ type SnapshotResponse struct {
 
 func (x *SnapshotResponse) Reset() {
 	*x = SnapshotResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2162,7 +2409,7 @@ func (x *SnapshotResponse) String() string {
 func (*SnapshotResponse) ProtoMessage() {}
 
 func (x *SnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[29]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2175,7 +2422,7 @@ func (x *SnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotResponse.ProtoReflect.Descriptor instead.
 func (*SnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{29}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *SnapshotResponse) GetState() []byte {
@@ -2203,7 +2450,7 @@ type RestoreRequest struct {
 
 func (x *RestoreRequest) Reset() {
 	*x = RestoreRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2215,7 +2462,7 @@ func (x *RestoreRequest) String() string {
 func (*RestoreRequest) ProtoMessage() {}
 
 func (x *RestoreRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[30]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2228,7 +2475,7 @@ func (x *RestoreRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreRequest.ProtoReflect.Descriptor instead.
 func (*RestoreRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{30}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RestoreRequest) GetSessionId() string {
@@ -2260,7 +2507,7 @@ type RestoreResponse struct {
 
 func (x *RestoreResponse) Reset() {
 	*x = RestoreResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2272,7 +2519,7 @@ func (x *RestoreResponse) String() string {
 func (*RestoreResponse) ProtoMessage() {}
 
 func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[31]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2285,7 +2532,7 @@ func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreResponse.ProtoReflect.Descriptor instead.
 func (*RestoreResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{31}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{33}
 }
 
 // SnapshotVersionMismatch is returned as a gRPC/Connect error detail when a
@@ -2302,7 +2549,7 @@ type SnapshotVersionMismatch struct {
 
 func (x *SnapshotVersionMismatch) Reset() {
 	*x = SnapshotVersionMismatch{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2314,7 +2561,7 @@ func (x *SnapshotVersionMismatch) String() string {
 func (*SnapshotVersionMismatch) ProtoMessage() {}
 
 func (x *SnapshotVersionMismatch) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[32]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2327,7 +2574,7 @@ func (x *SnapshotVersionMismatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotVersionMismatch.ProtoReflect.Descriptor instead.
 func (*SnapshotVersionMismatch) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{32}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *SnapshotVersionMismatch) GetHave() uint32 {
@@ -2353,7 +2600,7 @@ type InspectRequest struct {
 
 func (x *InspectRequest) Reset() {
 	*x = InspectRequest{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[33]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2365,7 +2612,7 @@ func (x *InspectRequest) String() string {
 func (*InspectRequest) ProtoMessage() {}
 
 func (x *InspectRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[33]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2378,7 +2625,7 @@ func (x *InspectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectRequest.ProtoReflect.Descriptor instead.
 func (*InspectRequest) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{33}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *InspectRequest) GetSessionId() string {
@@ -2400,7 +2647,7 @@ type InspectField struct {
 
 func (x *InspectField) Reset() {
 	*x = InspectField{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[34]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2412,7 +2659,7 @@ func (x *InspectField) String() string {
 func (*InspectField) ProtoMessage() {}
 
 func (x *InspectField) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[34]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2425,7 +2672,7 @@ func (x *InspectField) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectField.ProtoReflect.Descriptor instead.
 func (*InspectField) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{34}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *InspectField) GetKey() string {
@@ -2462,7 +2709,7 @@ type InspectResponse struct {
 
 func (x *InspectResponse) Reset() {
 	*x = InspectResponse{}
-	mi := &file_criteria_v2_adapter_proto_msgTypes[35]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2474,7 +2721,7 @@ func (x *InspectResponse) String() string {
 func (*InspectResponse) ProtoMessage() {}
 
 func (x *InspectResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_criteria_v2_adapter_proto_msgTypes[35]
+	mi := &file_criteria_v2_adapter_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2487,7 +2734,7 @@ func (x *InspectResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectResponse.ProtoReflect.Descriptor instead.
 func (*InspectResponse) Descriptor() ([]byte, []int) {
-	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{35}
+	return file_criteria_v2_adapter_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *InspectResponse) GetCurrentStep() string {
@@ -2601,14 +2848,26 @@ const file_criteria_v2_adapter_proto_rawDesc = "" +
 	"\x13CloseSessionRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionIdJ\x05\bd\x10\xe8\a\"\x1d\n" +
-	"\x14CloseSessionResponseJ\x05\bd\x10\xe8\a\"\x91\x03\n" +
+	"\x14CloseSessionResponseJ\x05\bd\x10\xe8\a\"\x92\x01\n" +
+	"\x0fOutcomeContract\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1f\n" +
+	"\vschema_json\x18\x02 \x01(\fR\n" +
+	"schemaJson\x12\x1a\n" +
+	"\bfallback\x18\x03 \x01(\bR\bfallback\x12'\n" +
+	"\x0frequire_comment\x18\x04 \x01(\bR\x0erequireCommentJ\x05\bd\x10\xe8\a\"g\n" +
+	"\x12ExecutionRejection\x12\x18\n" +
+	"\aoutcome\x18\x01 \x01(\tR\aoutcome\x12\x16\n" +
+	"\x06issues\x18\x02 \x01(\tR\x06issues\x12\x18\n" +
+	"\aattempt\x18\x03 \x01(\rR\aattemptJ\x05\bd\x10\xe8\a\"\x9b\x04\n" +
 	"\x0eExecuteRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
 	"\tstep_name\x18\x02 \x01(\tR\bstepName\x12<\n" +
 	"\x05input\x18\x03 \x03(\v2&.criteria.v2.ExecuteRequest.InputEntryR\x05input\x12X\n" +
 	"\rsecret_inputs\x18\x04 \x03(\v2-.criteria.v2.ExecuteRequest.SecretInputsEntryB\x04\x80\x97\"\x01R\fsecretInputs\x12)\n" +
-	"\x10allowed_outcomes\x18\x05 \x03(\tR\x0fallowedOutcomes\x1a8\n" +
+	"\x10allowed_outcomes\x18\x05 \x03(\tR\x0fallowedOutcomes\x12I\n" +
+	"\x11outcome_contracts\x18\x06 \x03(\v2\x1c.criteria.v2.OutcomeContractR\x10outcomeContracts\x12=\n" +
+	"\trejection\x18\a \x01(\v2\x1f.criteria.v2.ExecutionRejectionR\trejection\x1a8\n" +
 	"\n" +
 	"InputEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
@@ -2628,11 +2887,12 @@ const file_criteria_v2_adapter_proto_rawDesc = "" +
 	"\ttool_name\x18\x01 \x01(\tR\btoolName\x12+\n" +
 	"\x04args\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x04args\x129\n" +
 	"\n" +
-	"invoked_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tinvokedAtJ\x05\bd\x10\xe8\a\"\x8c\x01\n" +
+	"invoked_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tinvokedAtJ\x05\bd\x10\xe8\a\"\xa6\x01\n" +
 	"\rExecuteResult\x12\x18\n" +
 	"\aoutcome\x18\x01 \x01(\tR\aoutcome\x12(\n" +
 	"\x05chunk\x18\x03 \x01(\v2\x12.criteria.v2.ChunkR\x05chunk\x12!\n" +
-	"\foutputs_json\x18\x04 \x01(\fR\voutputsJsonJ\x04\b\x02\x10\x03J\x05\bd\x10\xe8\aR\aoutputs\"\xf6\x01\n" +
+	"\foutputs_json\x18\x04 \x01(\fR\voutputsJson\x12\x18\n" +
+	"\acomment\x18\x05 \x01(\tR\acommentJ\x04\b\x02\x10\x03J\x05\bd\x10\xe8\aR\aoutputs\"\xf6\x01\n" +
 	"\fExecuteEvent\x125\n" +
 	"\aadapter\x18\x01 \x01(\v2\x19.criteria.v2.AdapterEventH\x00R\aadapter\x121\n" +
 	"\x04tool\x18\x02 \x01(\v2\x1b.criteria.v2.ToolInvocationH\x00R\x04tool\x124\n" +
@@ -2745,7 +3005,7 @@ func file_criteria_v2_adapter_proto_rawDescGZIP() []byte {
 	return file_criteria_v2_adapter_proto_rawDescData
 }
 
-var file_criteria_v2_adapter_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
+var file_criteria_v2_adapter_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
 var file_criteria_v2_adapter_proto_goTypes = []any{
 	(*Chunk)(nil),                   // 0: criteria.v2.Chunk
 	(*Heartbeat)(nil),               // 1: criteria.v2.Heartbeat
@@ -2759,103 +3019,107 @@ var file_criteria_v2_adapter_proto_goTypes = []any{
 	(*OpenSessionResponse)(nil),     // 9: criteria.v2.OpenSessionResponse
 	(*CloseSessionRequest)(nil),     // 10: criteria.v2.CloseSessionRequest
 	(*CloseSessionResponse)(nil),    // 11: criteria.v2.CloseSessionResponse
-	(*ExecuteRequest)(nil),          // 12: criteria.v2.ExecuteRequest
-	(*AdapterEvent)(nil),            // 13: criteria.v2.AdapterEvent
-	(*ToolInvocation)(nil),          // 14: criteria.v2.ToolInvocation
-	(*ExecuteResult)(nil),           // 15: criteria.v2.ExecuteResult
-	(*ExecuteEvent)(nil),            // 16: criteria.v2.ExecuteEvent
-	(*LogRequest)(nil),              // 17: criteria.v2.LogRequest
-	(*LogEvent)(nil),                // 18: criteria.v2.LogEvent
-	(*PermissionRequest)(nil),       // 19: criteria.v2.PermissionRequest
-	(*PermissionCancel)(nil),        // 20: criteria.v2.PermissionCancel
-	(*ToolCallResult)(nil),          // 21: criteria.v2.ToolCallResult
-	(*PermissionEvent)(nil),         // 22: criteria.v2.PermissionEvent
-	(*PermissionDecision)(nil),      // 23: criteria.v2.PermissionDecision
-	(*PauseRequest)(nil),            // 24: criteria.v2.PauseRequest
-	(*PauseResponse)(nil),           // 25: criteria.v2.PauseResponse
-	(*ResumeRequest)(nil),           // 26: criteria.v2.ResumeRequest
-	(*ResumeResponse)(nil),          // 27: criteria.v2.ResumeResponse
-	(*SnapshotRequest)(nil),         // 28: criteria.v2.SnapshotRequest
-	(*SnapshotResponse)(nil),        // 29: criteria.v2.SnapshotResponse
-	(*RestoreRequest)(nil),          // 30: criteria.v2.RestoreRequest
-	(*RestoreResponse)(nil),         // 31: criteria.v2.RestoreResponse
-	(*SnapshotVersionMismatch)(nil), // 32: criteria.v2.SnapshotVersionMismatch
-	(*InspectRequest)(nil),          // 33: criteria.v2.InspectRequest
-	(*InspectField)(nil),            // 34: criteria.v2.InspectField
-	(*InspectResponse)(nil),         // 35: criteria.v2.InspectResponse
-	nil,                             // 36: criteria.v2.AdapterSchemaProto.FieldsEntry
-	nil,                             // 37: criteria.v2.InfoResponse.SecretsEntry
-	nil,                             // 38: criteria.v2.OpenSessionRequest.ConfigEntry
-	nil,                             // 39: criteria.v2.OpenSessionRequest.SecretsEntry
-	nil,                             // 40: criteria.v2.ExecuteRequest.InputEntry
-	nil,                             // 41: criteria.v2.ExecuteRequest.SecretInputsEntry
-	(*timestamppb.Timestamp)(nil),   // 42: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),         // 43: google.protobuf.Struct
-	(*structpb.Value)(nil),          // 44: google.protobuf.Value
+	(*OutcomeContract)(nil),         // 12: criteria.v2.OutcomeContract
+	(*ExecutionRejection)(nil),      // 13: criteria.v2.ExecutionRejection
+	(*ExecuteRequest)(nil),          // 14: criteria.v2.ExecuteRequest
+	(*AdapterEvent)(nil),            // 15: criteria.v2.AdapterEvent
+	(*ToolInvocation)(nil),          // 16: criteria.v2.ToolInvocation
+	(*ExecuteResult)(nil),           // 17: criteria.v2.ExecuteResult
+	(*ExecuteEvent)(nil),            // 18: criteria.v2.ExecuteEvent
+	(*LogRequest)(nil),              // 19: criteria.v2.LogRequest
+	(*LogEvent)(nil),                // 20: criteria.v2.LogEvent
+	(*PermissionRequest)(nil),       // 21: criteria.v2.PermissionRequest
+	(*PermissionCancel)(nil),        // 22: criteria.v2.PermissionCancel
+	(*ToolCallResult)(nil),          // 23: criteria.v2.ToolCallResult
+	(*PermissionEvent)(nil),         // 24: criteria.v2.PermissionEvent
+	(*PermissionDecision)(nil),      // 25: criteria.v2.PermissionDecision
+	(*PauseRequest)(nil),            // 26: criteria.v2.PauseRequest
+	(*PauseResponse)(nil),           // 27: criteria.v2.PauseResponse
+	(*ResumeRequest)(nil),           // 28: criteria.v2.ResumeRequest
+	(*ResumeResponse)(nil),          // 29: criteria.v2.ResumeResponse
+	(*SnapshotRequest)(nil),         // 30: criteria.v2.SnapshotRequest
+	(*SnapshotResponse)(nil),        // 31: criteria.v2.SnapshotResponse
+	(*RestoreRequest)(nil),          // 32: criteria.v2.RestoreRequest
+	(*RestoreResponse)(nil),         // 33: criteria.v2.RestoreResponse
+	(*SnapshotVersionMismatch)(nil), // 34: criteria.v2.SnapshotVersionMismatch
+	(*InspectRequest)(nil),          // 35: criteria.v2.InspectRequest
+	(*InspectField)(nil),            // 36: criteria.v2.InspectField
+	(*InspectResponse)(nil),         // 37: criteria.v2.InspectResponse
+	nil,                             // 38: criteria.v2.AdapterSchemaProto.FieldsEntry
+	nil,                             // 39: criteria.v2.InfoResponse.SecretsEntry
+	nil,                             // 40: criteria.v2.OpenSessionRequest.ConfigEntry
+	nil,                             // 41: criteria.v2.OpenSessionRequest.SecretsEntry
+	nil,                             // 42: criteria.v2.ExecuteRequest.InputEntry
+	nil,                             // 43: criteria.v2.ExecuteRequest.SecretInputsEntry
+	(*timestamppb.Timestamp)(nil),   // 44: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),         // 45: google.protobuf.Struct
+	(*structpb.Value)(nil),          // 46: google.protobuf.Value
 }
 var file_criteria_v2_adapter_proto_depIdxs = []int32{
-	42, // 0: criteria.v2.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
-	36, // 1: criteria.v2.AdapterSchemaProto.fields:type_name -> criteria.v2.AdapterSchemaProto.FieldsEntry
+	44, // 0: criteria.v2.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
+	38, // 1: criteria.v2.AdapterSchemaProto.fields:type_name -> criteria.v2.AdapterSchemaProto.FieldsEntry
 	3,  // 2: criteria.v2.InfoResponse.config_schema:type_name -> criteria.v2.AdapterSchemaProto
 	3,  // 3: criteria.v2.InfoResponse.input_schema:type_name -> criteria.v2.AdapterSchemaProto
 	3,  // 4: criteria.v2.InfoResponse.output_schema:type_name -> criteria.v2.AdapterSchemaProto
-	37, // 5: criteria.v2.InfoResponse.secrets:type_name -> criteria.v2.InfoResponse.SecretsEntry
+	39, // 5: criteria.v2.InfoResponse.secrets:type_name -> criteria.v2.InfoResponse.SecretsEntry
 	6,  // 6: criteria.v2.InfoResponse.tools:type_name -> criteria.v2.ToolInfo
 	7,  // 7: criteria.v2.InfoResponse.state:type_name -> criteria.v2.StateDescriptor
-	38, // 8: criteria.v2.OpenSessionRequest.config:type_name -> criteria.v2.OpenSessionRequest.ConfigEntry
-	39, // 9: criteria.v2.OpenSessionRequest.secrets:type_name -> criteria.v2.OpenSessionRequest.SecretsEntry
-	40, // 10: criteria.v2.ExecuteRequest.input:type_name -> criteria.v2.ExecuteRequest.InputEntry
-	41, // 11: criteria.v2.ExecuteRequest.secret_inputs:type_name -> criteria.v2.ExecuteRequest.SecretInputsEntry
-	43, // 12: criteria.v2.AdapterEvent.payload:type_name -> google.protobuf.Struct
-	42, // 13: criteria.v2.AdapterEvent.emitted_at:type_name -> google.protobuf.Timestamp
-	0,  // 14: criteria.v2.AdapterEvent.chunk:type_name -> criteria.v2.Chunk
-	43, // 15: criteria.v2.ToolInvocation.args:type_name -> google.protobuf.Struct
-	42, // 16: criteria.v2.ToolInvocation.invoked_at:type_name -> google.protobuf.Timestamp
-	0,  // 17: criteria.v2.ExecuteResult.chunk:type_name -> criteria.v2.Chunk
-	13, // 18: criteria.v2.ExecuteEvent.adapter:type_name -> criteria.v2.AdapterEvent
-	14, // 19: criteria.v2.ExecuteEvent.tool:type_name -> criteria.v2.ToolInvocation
-	15, // 20: criteria.v2.ExecuteEvent.result:type_name -> criteria.v2.ExecuteResult
-	1,  // 21: criteria.v2.ExecuteEvent.heartbeat:type_name -> criteria.v2.Heartbeat
-	42, // 22: criteria.v2.LogEvent.timestamp:type_name -> google.protobuf.Timestamp
-	1,  // 23: criteria.v2.LogEvent.heartbeat:type_name -> criteria.v2.Heartbeat
-	0,  // 24: criteria.v2.LogEvent.chunk:type_name -> criteria.v2.Chunk
-	0,  // 25: criteria.v2.ToolCallResult.chunk:type_name -> criteria.v2.Chunk
-	19, // 26: criteria.v2.PermissionEvent.request:type_name -> criteria.v2.PermissionRequest
-	20, // 27: criteria.v2.PermissionEvent.cancel:type_name -> criteria.v2.PermissionCancel
-	21, // 28: criteria.v2.PermissionEvent.tool_call_result:type_name -> criteria.v2.ToolCallResult
-	1,  // 29: criteria.v2.PermissionDecision.heartbeat:type_name -> criteria.v2.Heartbeat
-	44, // 30: criteria.v2.InspectField.value:type_name -> google.protobuf.Value
-	42, // 31: criteria.v2.InspectResponse.last_activity_at:type_name -> google.protobuf.Timestamp
-	34, // 32: criteria.v2.InspectResponse.fields:type_name -> criteria.v2.InspectField
-	43, // 33: criteria.v2.InspectResponse.extra:type_name -> google.protobuf.Struct
-	2,  // 34: criteria.v2.AdapterSchemaProto.FieldsEntry.value:type_name -> criteria.v2.ConfigFieldProto
-	4,  // 35: criteria.v2.AdapterService.Info:input_type -> criteria.v2.InfoRequest
-	8,  // 36: criteria.v2.AdapterService.OpenSession:input_type -> criteria.v2.OpenSessionRequest
-	12, // 37: criteria.v2.AdapterService.Execute:input_type -> criteria.v2.ExecuteRequest
-	17, // 38: criteria.v2.AdapterService.Log:input_type -> criteria.v2.LogRequest
-	22, // 39: criteria.v2.AdapterService.Permissions:input_type -> criteria.v2.PermissionEvent
-	24, // 40: criteria.v2.AdapterService.Pause:input_type -> criteria.v2.PauseRequest
-	26, // 41: criteria.v2.AdapterService.Resume:input_type -> criteria.v2.ResumeRequest
-	28, // 42: criteria.v2.AdapterService.Snapshot:input_type -> criteria.v2.SnapshotRequest
-	30, // 43: criteria.v2.AdapterService.Restore:input_type -> criteria.v2.RestoreRequest
-	33, // 44: criteria.v2.AdapterService.Inspect:input_type -> criteria.v2.InspectRequest
-	10, // 45: criteria.v2.AdapterService.CloseSession:input_type -> criteria.v2.CloseSessionRequest
-	5,  // 46: criteria.v2.AdapterService.Info:output_type -> criteria.v2.InfoResponse
-	9,  // 47: criteria.v2.AdapterService.OpenSession:output_type -> criteria.v2.OpenSessionResponse
-	16, // 48: criteria.v2.AdapterService.Execute:output_type -> criteria.v2.ExecuteEvent
-	18, // 49: criteria.v2.AdapterService.Log:output_type -> criteria.v2.LogEvent
-	23, // 50: criteria.v2.AdapterService.Permissions:output_type -> criteria.v2.PermissionDecision
-	25, // 51: criteria.v2.AdapterService.Pause:output_type -> criteria.v2.PauseResponse
-	27, // 52: criteria.v2.AdapterService.Resume:output_type -> criteria.v2.ResumeResponse
-	29, // 53: criteria.v2.AdapterService.Snapshot:output_type -> criteria.v2.SnapshotResponse
-	31, // 54: criteria.v2.AdapterService.Restore:output_type -> criteria.v2.RestoreResponse
-	35, // 55: criteria.v2.AdapterService.Inspect:output_type -> criteria.v2.InspectResponse
-	11, // 56: criteria.v2.AdapterService.CloseSession:output_type -> criteria.v2.CloseSessionResponse
-	46, // [46:57] is the sub-list for method output_type
-	35, // [35:46] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	40, // 8: criteria.v2.OpenSessionRequest.config:type_name -> criteria.v2.OpenSessionRequest.ConfigEntry
+	41, // 9: criteria.v2.OpenSessionRequest.secrets:type_name -> criteria.v2.OpenSessionRequest.SecretsEntry
+	42, // 10: criteria.v2.ExecuteRequest.input:type_name -> criteria.v2.ExecuteRequest.InputEntry
+	43, // 11: criteria.v2.ExecuteRequest.secret_inputs:type_name -> criteria.v2.ExecuteRequest.SecretInputsEntry
+	12, // 12: criteria.v2.ExecuteRequest.outcome_contracts:type_name -> criteria.v2.OutcomeContract
+	13, // 13: criteria.v2.ExecuteRequest.rejection:type_name -> criteria.v2.ExecutionRejection
+	45, // 14: criteria.v2.AdapterEvent.payload:type_name -> google.protobuf.Struct
+	44, // 15: criteria.v2.AdapterEvent.emitted_at:type_name -> google.protobuf.Timestamp
+	0,  // 16: criteria.v2.AdapterEvent.chunk:type_name -> criteria.v2.Chunk
+	45, // 17: criteria.v2.ToolInvocation.args:type_name -> google.protobuf.Struct
+	44, // 18: criteria.v2.ToolInvocation.invoked_at:type_name -> google.protobuf.Timestamp
+	0,  // 19: criteria.v2.ExecuteResult.chunk:type_name -> criteria.v2.Chunk
+	15, // 20: criteria.v2.ExecuteEvent.adapter:type_name -> criteria.v2.AdapterEvent
+	16, // 21: criteria.v2.ExecuteEvent.tool:type_name -> criteria.v2.ToolInvocation
+	17, // 22: criteria.v2.ExecuteEvent.result:type_name -> criteria.v2.ExecuteResult
+	1,  // 23: criteria.v2.ExecuteEvent.heartbeat:type_name -> criteria.v2.Heartbeat
+	44, // 24: criteria.v2.LogEvent.timestamp:type_name -> google.protobuf.Timestamp
+	1,  // 25: criteria.v2.LogEvent.heartbeat:type_name -> criteria.v2.Heartbeat
+	0,  // 26: criteria.v2.LogEvent.chunk:type_name -> criteria.v2.Chunk
+	0,  // 27: criteria.v2.ToolCallResult.chunk:type_name -> criteria.v2.Chunk
+	21, // 28: criteria.v2.PermissionEvent.request:type_name -> criteria.v2.PermissionRequest
+	22, // 29: criteria.v2.PermissionEvent.cancel:type_name -> criteria.v2.PermissionCancel
+	23, // 30: criteria.v2.PermissionEvent.tool_call_result:type_name -> criteria.v2.ToolCallResult
+	1,  // 31: criteria.v2.PermissionDecision.heartbeat:type_name -> criteria.v2.Heartbeat
+	46, // 32: criteria.v2.InspectField.value:type_name -> google.protobuf.Value
+	44, // 33: criteria.v2.InspectResponse.last_activity_at:type_name -> google.protobuf.Timestamp
+	36, // 34: criteria.v2.InspectResponse.fields:type_name -> criteria.v2.InspectField
+	45, // 35: criteria.v2.InspectResponse.extra:type_name -> google.protobuf.Struct
+	2,  // 36: criteria.v2.AdapterSchemaProto.FieldsEntry.value:type_name -> criteria.v2.ConfigFieldProto
+	4,  // 37: criteria.v2.AdapterService.Info:input_type -> criteria.v2.InfoRequest
+	8,  // 38: criteria.v2.AdapterService.OpenSession:input_type -> criteria.v2.OpenSessionRequest
+	14, // 39: criteria.v2.AdapterService.Execute:input_type -> criteria.v2.ExecuteRequest
+	19, // 40: criteria.v2.AdapterService.Log:input_type -> criteria.v2.LogRequest
+	24, // 41: criteria.v2.AdapterService.Permissions:input_type -> criteria.v2.PermissionEvent
+	26, // 42: criteria.v2.AdapterService.Pause:input_type -> criteria.v2.PauseRequest
+	28, // 43: criteria.v2.AdapterService.Resume:input_type -> criteria.v2.ResumeRequest
+	30, // 44: criteria.v2.AdapterService.Snapshot:input_type -> criteria.v2.SnapshotRequest
+	32, // 45: criteria.v2.AdapterService.Restore:input_type -> criteria.v2.RestoreRequest
+	35, // 46: criteria.v2.AdapterService.Inspect:input_type -> criteria.v2.InspectRequest
+	10, // 47: criteria.v2.AdapterService.CloseSession:input_type -> criteria.v2.CloseSessionRequest
+	5,  // 48: criteria.v2.AdapterService.Info:output_type -> criteria.v2.InfoResponse
+	9,  // 49: criteria.v2.AdapterService.OpenSession:output_type -> criteria.v2.OpenSessionResponse
+	18, // 50: criteria.v2.AdapterService.Execute:output_type -> criteria.v2.ExecuteEvent
+	20, // 51: criteria.v2.AdapterService.Log:output_type -> criteria.v2.LogEvent
+	25, // 52: criteria.v2.AdapterService.Permissions:output_type -> criteria.v2.PermissionDecision
+	27, // 53: criteria.v2.AdapterService.Pause:output_type -> criteria.v2.PauseResponse
+	29, // 54: criteria.v2.AdapterService.Resume:output_type -> criteria.v2.ResumeResponse
+	31, // 55: criteria.v2.AdapterService.Snapshot:output_type -> criteria.v2.SnapshotResponse
+	33, // 56: criteria.v2.AdapterService.Restore:output_type -> criteria.v2.RestoreResponse
+	37, // 57: criteria.v2.AdapterService.Inspect:output_type -> criteria.v2.InspectResponse
+	11, // 58: criteria.v2.AdapterService.CloseSession:output_type -> criteria.v2.CloseSessionResponse
+	48, // [48:59] is the sub-list for method output_type
+	37, // [37:48] is the sub-list for method input_type
+	37, // [37:37] is the sub-list for extension type_name
+	37, // [37:37] is the sub-list for extension extendee
+	0,  // [0:37] is the sub-list for field type_name
 }
 
 func init() { file_criteria_v2_adapter_proto_init() }
@@ -2865,13 +3129,13 @@ func file_criteria_v2_adapter_proto_init() {
 	}
 	file_criteria_v2_options_proto_init()
 	file_criteria_v2_adapter_proto_msgTypes[6].OneofWrappers = []any{}
-	file_criteria_v2_adapter_proto_msgTypes[16].OneofWrappers = []any{
+	file_criteria_v2_adapter_proto_msgTypes[18].OneofWrappers = []any{
 		(*ExecuteEvent_Adapter)(nil),
 		(*ExecuteEvent_Tool)(nil),
 		(*ExecuteEvent_Result)(nil),
 		(*ExecuteEvent_Heartbeat)(nil),
 	}
-	file_criteria_v2_adapter_proto_msgTypes[22].OneofWrappers = []any{
+	file_criteria_v2_adapter_proto_msgTypes[24].OneofWrappers = []any{
 		(*PermissionEvent_Request)(nil),
 		(*PermissionEvent_Cancel)(nil),
 		(*PermissionEvent_ToolCallResult)(nil),
@@ -2882,7 +3146,7 @@ func file_criteria_v2_adapter_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_criteria_v2_adapter_proto_rawDesc), len(file_criteria_v2_adapter_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   42,
+			NumMessages:   44,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

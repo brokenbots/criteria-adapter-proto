@@ -1,0 +1,39 @@
+{
+  "name": "require_comment with missing comment rejected",
+  "phases": [
+    {
+      "expect": {
+        "accepted": false,
+        "issues": [
+          "missing_comment: outcome \"completed\" requires a comment (require_comment)"
+        ],
+        "rejection": {
+          "attempt": 1,
+          "issues": "missing_comment: outcome \"completed\" requires a comment (require_comment)",
+          "outcome": "completed"
+        }
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [
+          {
+            "name": "completed",
+            "requireComment": true,
+            "schemaJson": "eyJ0eXBlIjoib2JqZWN0IiwicmVxdWlyZWQiOlsic3VtbWFyeSIsImV4aXRfY29kZSJdLCJwcm9wZXJ0aWVzIjp7InN1bW1hcnkiOnsidHlwZSI6InN0cmluZyJ9LCJleGl0X2NvZGUiOnsidHlwZSI6Im51bWJlciJ9fX0="
+          }
+        ],
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": [
+        {
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5IjoiMyBmaWxlcyBsaW50ZWQiLCJleGl0X2NvZGUiOjB9"
+        }
+      ]
+    }
+  ]
+}

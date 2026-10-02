@@ -1,0 +1,32 @@
+{
+  "name": "empty outcome_contracts behaves byte-for-byte like pre-v0.7.0",
+  "phases": [
+    {
+      "expect": {
+        "accepted": true,
+        "forwarded": {
+          "comment": "legacy pass",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5Ijo0Mn0="
+        },
+        "issues": []
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [],
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": [
+        {
+          "comment": "legacy pass",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5Ijo0Mn0="
+        }
+      ]
+    }
+  ]
+}
