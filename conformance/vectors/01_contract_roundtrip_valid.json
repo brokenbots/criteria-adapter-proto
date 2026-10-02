@@ -1,0 +1,37 @@
+{
+  "name": "contract round-trip: valid payload forwarded verbatim",
+  "phases": [
+    {
+      "expect": {
+        "accepted": true,
+        "forwarded": {
+          "comment": "summarized 3 files",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5IjoiMyBmaWxlcyBsaW50ZWQiLCJleGl0X2NvZGUiOjB9"
+        },
+        "issues": []
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [
+          {
+            "name": "completed",
+            "schemaJson": "eyJ0eXBlIjoib2JqZWN0IiwicmVxdWlyZWQiOlsic3VtbWFyeSIsImV4aXRfY29kZSJdLCJwcm9wZXJ0aWVzIjp7InN1bW1hcnkiOnsidHlwZSI6InN0cmluZyJ9LCJleGl0X2NvZGUiOnsidHlwZSI6Im51bWJlciJ9fX0="
+          }
+        ],
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": [
+        {
+          "comment": "summarized 3 files",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5IjoiMyBmaWxlcyBsaW50ZWQiLCJleGl0X2NvZGUiOjB9"
+        }
+      ]
+    }
+  ]
+}

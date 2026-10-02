@@ -1,0 +1,32 @@
+{
+  "name": "ExecuteResult.comment plumbs end to end (wire round-trip)",
+  "phases": [
+    {
+      "expect": {
+        "accepted": true,
+        "forwarded": {
+          "comment": "release notes drafted",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5Ijoibm90ZXMgd3JpdHRlbiIsImV4aXRfY29kZSI6MH0="
+        },
+        "issues": []
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [],
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": [
+        {
+          "comment": "release notes drafted",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5Ijoibm90ZXMgd3JpdHRlbiIsImV4aXRfY29kZSI6MH0="
+        }
+      ]
+    }
+  ]
+}
