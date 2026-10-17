@@ -7,6 +7,43 @@ additive changes (new messages, new fields, new well-known event kinds) are
 MINOR; field removals, renumbering, or semantic shifts are MAJOR and must pass
 `make proto-lint`'s `buf breaking` gate against the previous release tag.
 
+## [v0.8.0] — declared step timeout carrier (KB-282)
+
+Additive minor over v0.7.0: one new request field. No field is removed or
+renumbered; `buf breaking` against `v0.7.0` must stay clean.
+
+### Added — proto
+
+- `ExecuteRequest.timeout_ms` (NEW field 8, `int64`, unit: milliseconds) —
+  the workflow's declared step timeout, forwarded from the engine's step
+  declaration so adapters can enforce the host's deadline on their own
+  execution (KB-212 leg 2 populates it; KB-283 leg 3 honors it on the
+  shell adapter). It is a wire carrier only: enforcement (kill, retry,
+  typed-failure reporting) stays the adapter's policy per its own
+  execution capabilities. `timeout_ms = 0`/absent = unset — the adapter
+  applies its own default, today's behavior byte-for-byte (the shell
+  adapter otherwise kills long steps at its own 5m default; KB-95/KB-96
+  evidence on KB-212).
+- Conformance vectors and the pinned reference validator are unchanged:
+  the carrier is request-only metadata with no response-side contract to
+  pin, so the shared vectors stay byte-identical.
+
+### Compatibility matrix
+
+| Host \ Adapter | v0.7.x (pre-carrier) | v0.8.0 (carrier-aware) |
+|---|---|---|
+| **v0.7.x host** | unchanged | unchanged: the old host never populates `timeout_ms`, so the adapter keeps applying its own default |
+| **v0.8.0 host** | works: the old adapter receives `timeout_ms` as an unknown field its generated code ignores and keeps applying its own default | declared timeouts reach the adapter |
+
+### Publishing (v0.8.0 release mechanics)
+
+- Tag `v0.8.0` triggers the existing publish flow: the Go module proxies
+  this module, and the tag-derived publish job generates the TypeScript
+  and Python bindings (`buf.gen.multi.yaml`).
+- npm publish is skipped by design (no `NPM_TOKEN` secret exists; see the
+  v0.7.0 notes). The engine pins v0.8.0 when KB-212 (leg 2) lands; the
+  shell pins it when KB-283 (leg 3) lands.
+
 ## [v0.7.0] — outcome-contract wave (KB-44)
 
 Additive minor over v0.6.0: one new request-scoped contract system, one new
