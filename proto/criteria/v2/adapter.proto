@@ -356,6 +356,19 @@ message ExecuteRequest {
   // rejection carries the previous attempt's rejection context; absent (nil)
   // = normal execute, non-empty = repair mode (see ExecutionRejection).
   ExecutionRejection rejection = 7;
+  // timeout_ms is the workflow's declared step timeout, in milliseconds,
+  // forwarded from the engine's step declaration so the adapter can enforce
+  // the host's deadline on its own execution instead of falling back to its
+  // private default. It is a wire carrier only: enforcement (kill, retry,
+  // reporting the lapse as a typed failure) stays the adapter's policy, per
+  // its own execution capabilities.
+  //
+  //   - timeout_ms = 0 (absent) = unset: the adapter applies its own default
+  //     — today's behavior byte-for-byte.
+  //   - Hosts and adapters predating v0.8.0 see neither side of this field:
+  //     old hosts never populate it, and old adapters receive it as an
+  //     unknown field their generated code ignores (additive policy).
+  int64 timeout_ms = 8;
   reserved 100 to 999;
 }
 

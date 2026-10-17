@@ -1124,7 +1124,20 @@ type ExecuteRequest struct {
 	OutcomeContracts []*OutcomeContract `protobuf:"bytes,6,rep,name=outcome_contracts,json=outcomeContracts,proto3" json:"outcome_contracts,omitempty"`
 	// rejection carries the previous attempt's rejection context; absent (nil)
 	// = normal execute, non-empty = repair mode (see ExecutionRejection).
-	Rejection     *ExecutionRejection `protobuf:"bytes,7,opt,name=rejection,proto3" json:"rejection,omitempty"`
+	Rejection *ExecutionRejection `protobuf:"bytes,7,opt,name=rejection,proto3" json:"rejection,omitempty"`
+	// timeout_ms is the workflow's declared step timeout, in milliseconds,
+	// forwarded from the engine's step declaration so the adapter can enforce
+	// the host's deadline on its own execution instead of falling back to its
+	// private default. It is a wire carrier only: enforcement (kill, retry,
+	// reporting the lapse as a typed failure) stays the adapter's policy, per
+	// its own execution capabilities.
+	//
+	//   - timeout_ms = 0 (absent) = unset: the adapter applies its own default
+	//     — today's behavior byte-for-byte.
+	//   - Hosts and adapters predating v0.8.0 see neither side of this field:
+	//     old hosts never populate it, and old adapters receive it as an
+	//     unknown field their generated code ignores (additive policy).
+	TimeoutMs     int64 `protobuf:"varint,8,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1206,6 +1219,13 @@ func (x *ExecuteRequest) GetRejection() *ExecutionRejection {
 		return x.Rejection
 	}
 	return nil
+}
+
+func (x *ExecuteRequest) GetTimeoutMs() int64 {
+	if x != nil {
+		return x.TimeoutMs
+	}
+	return 0
 }
 
 // AdapterEvent is a typed semantic event emitted by the adapter.
@@ -2858,7 +2878,7 @@ const file_criteria_v2_adapter_proto_rawDesc = "" +
 	"\x12ExecutionRejection\x12\x18\n" +
 	"\aoutcome\x18\x01 \x01(\tR\aoutcome\x12\x16\n" +
 	"\x06issues\x18\x02 \x01(\tR\x06issues\x12\x18\n" +
-	"\aattempt\x18\x03 \x01(\rR\aattemptJ\x05\bd\x10\xe8\a\"\x9b\x04\n" +
+	"\aattempt\x18\x03 \x01(\rR\aattemptJ\x05\bd\x10\xe8\a\"\xba\x04\n" +
 	"\x0eExecuteRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
@@ -2867,7 +2887,9 @@ const file_criteria_v2_adapter_proto_rawDesc = "" +
 	"\rsecret_inputs\x18\x04 \x03(\v2-.criteria.v2.ExecuteRequest.SecretInputsEntryB\x04\x80\x97\"\x01R\fsecretInputs\x12)\n" +
 	"\x10allowed_outcomes\x18\x05 \x03(\tR\x0fallowedOutcomes\x12I\n" +
 	"\x11outcome_contracts\x18\x06 \x03(\v2\x1c.criteria.v2.OutcomeContractR\x10outcomeContracts\x12=\n" +
-	"\trejection\x18\a \x01(\v2\x1f.criteria.v2.ExecutionRejectionR\trejection\x1a8\n" +
+	"\trejection\x18\a \x01(\v2\x1f.criteria.v2.ExecutionRejectionR\trejection\x12\x1d\n" +
+	"\n" +
+	"timeout_ms\x18\b \x01(\x03R\ttimeoutMs\x1a8\n" +
 	"\n" +
 	"InputEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
