@@ -24,7 +24,7 @@ func FuzzUnmarshalAdapterMessages(f *testing.F) {
 		&criteriav2.InfoResponse{Name: "seed"},
 		&criteriav2.OpenSessionRequest{SessionId: "s", Secrets: map[string]string{"k": "v"}},
 		&criteriav2.OpenSessionResponse{},
-		&criteriav2.ExecuteRequest{SessionId: "s", StepName: "step"},
+		&criteriav2.ExecuteRequest{SessionId: "s", StepName: "step", TimeoutMs: 60000},
 		&criteriav2.ExecuteEvent{},
 		&criteriav2.LogRequest{SessionId: "s"},
 		&criteriav2.LogEvent{},
