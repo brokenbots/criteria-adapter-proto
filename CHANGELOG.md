@@ -43,6 +43,10 @@ renumbered; `buf breaking` against `v0.7.0` must stay clean.
 - npm publish is skipped by design (no `NPM_TOKEN` secret exists; see the
   v0.7.0 notes). The engine pins v0.8.0 when KB-212 (leg 2) lands; the
   shell pins it when KB-283 (leg 3) lands.
+- Security-lane dependency bump rides the same release (no wire-contract
+  impact): `golang.org/x/net` 0.58.0 → 0.61.0 and the `go` directive
+  1.26.6 → 1.26.9, clearing the GO-2026-66xx advisories the `osv-scan`
+  gate flagged. Security updates bypass the 7-day cooldown by policy.
 
 ## [v0.7.0] — outcome-contract wave (KB-44)
 
