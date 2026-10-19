@@ -7,6 +7,52 @@ additive changes (new messages, new fields, new well-known event kinds) are
 MINOR; field removals, renumbering, or semantic shifts are MAJOR and must pass
 `make proto-lint`'s `buf breaking` gate against the previous release tag.
 
+## [v0.9.0] — authored showcase examples on InfoResponse (KB-176)
+
+Additive minor over v0.8.0: one new response field and one new message. No
+field is removed or renumbered; `buf breaking` against the last release must
+stay clean.
+
+### Added — proto
+
+- `InfoResponse.examples` (NEW field 19, repeated `Example`) — authored
+  showcase workflows demonstrating typical adapter usage (KB-176; split of
+  the KB-176 card, wire numbering after tools=17 / state=18). The entries
+  are hand-written content the adapter author ships in the binary, not
+  generated output. Field 19 is a pure response carrier: an old host that
+  does not know it ignores it as an unknown field (proto3 standard), so
+  adapters may start shipping examples the moment this release is pinned.
+- `Example` (NEW message) — one showcased workflow:
+
+  | Field        | Number | Type   | Meaning |
+  |--------------|--------|--------|---------|
+  | `name`        | 1 | string | short human-readable title |
+  | `description` | 2 | string | one-line summary of when to reach for this workflow |
+  | `hcl`         | 3 | string | complete, valid criteria workflow body fragment the author warrants |
+  | *reserved*    | 100–999 | | |
+
+  `hcl` is authored, warranted content: the host may render or compile it
+  as-is without further validation. Keep the list short — InfoResponse is
+  sent at every handshake (and re-verification), so the list multiplies
+  across every handshake; the same guidance applies to each fragment.
+
+### Compatibility matrix
+
+| Host \ Adapter | v0.8.x (pre-examples) | v0.9.0 (examples-aware) |
+|---|---|---|
+| **v0.8.x host** | unchanged | works: the old host receives `examples` as an unknown field its generated code ignores; decode and re-encode preserve it verbatim |
+| **v0.9.0 host** | unchanged: the old adapter sends no `examples`, so the host sees an empty/absent list | showcase examples flow to the host at every handshake |
+
+### Publishing (v0.9.0 release mechanics)
+
+- Tag `v0.9.0` triggers the existing publish flow: the Go module proxies
+  this module, and the tag-derived publish job generates the TypeScript
+  and Python bindings (`buf.gen.multi.yaml`).
+- npm publish stays skipped by design (no `NPM_TOKEN` secret exists; see the
+  v0.7.0 notes). The SDK cards KB-177a / KB-178a / KB-179a pin v0.9.0 as
+  the settled reference (recorded on card KB-288 at development time) for
+  their own first-step module bumps.
+
 ## [v0.8.0] — declared step timeout carrier (KB-282)
 
 Additive minor over v0.7.0: one new request field. No field is removed or

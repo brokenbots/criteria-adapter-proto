@@ -155,6 +155,14 @@ message InfoResponse {
   // sent at every handshake and re-verification, so the declaration travels
   // with every relaunch.
   StateDescriptor state = 18; // NEW v2 (CRI-201)
+  // examples are authored showcase workflows demonstrating typical adapter
+  // usage (KB-176).  Each entry is hand-written content the adapter author
+  // ships in the binary — not generated output.  hcl is a complete, valid
+  // criteria workflow body fragment the author warrants: the host may
+  // render or compile it as-is without further validation.  Keep the list
+  // short: InfoResponse is sent at every handshake (and re-verification),
+  // so the list multiplies across every handshake.
+  repeated Example examples = 19; // NEW v2 (KB-176)
   reserved 100 to 999;
 }
 
@@ -210,6 +218,23 @@ message StateDescriptor {
   // values are ignored for forward-compatibility; the host falls back to
   // its own default save policy.
   string granularity = 4;
+  reserved 100 to 999;
+}
+
+// Example is a single entry of InfoResponse.examples: an authored showcase
+// workflow demonstrating typical adapter usage (KB-176).  Entries are
+// hand-written static content, not generated output — the example travels
+// in every InfoResponse, so keep both the list and each fragment short.
+message Example {
+  // name is a short human-readable title for the showcase workflow.
+  string name = 1;
+  // description is a one-line summary of when to reach for this workflow.
+  string description = 2;
+  // hcl is the example body itself: a complete, valid criteria workflow
+  // body fragment the author warrants (it is authored content, not
+  // generated output, and carries no runtime contract beyond being
+  // well-formed criteria HCL).
+  string hcl = 3;
   reserved 100 to 999;
 }
 

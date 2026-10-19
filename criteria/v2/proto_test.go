@@ -1,10 +1,12 @@
 package criteriav2_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -221,6 +223,152 @@ func TestInfoResponse_State_WireFieldNumbers(t *testing.T) {
 	assert.Equal(t, protoreflect.FieldNumber(2), descDesc.Fields().ByName("schema").Number())
 	assert.Equal(t, protoreflect.FieldNumber(3), descDesc.Fields().ByName("max_bytes").Number())
 	assert.Equal(t, protoreflect.FieldNumber(4), descDesc.Fields().ByName("granularity").Number())
+}
+
+// TestInfoResponse_Examples_RoundTrip asserts the KB-176 showcase contract:
+// InfoResponse.examples carries authored Example entries (name, description,
+// hcl) and they survive the proto wire round-trip unchanged.  An absent list
+// must stay absent — an adapter that ships no examples behaves exactly as
+// before, byte-for-byte (the change is additive; an old host ignores field 19
+// as an unknown field per proto3 semantics).  Each hcl fragment is a
+// complete, valid criteria workflow body fragment the author warrants, so it
+// must round-trip byte-faithfully.
+func TestInfoResponse_Examples_RoundTrip(t *testing.T) {
+	hcl := `step "review" "lint" { adapter = "shell" run = "true" }`
+	msg := &criteriav2.InfoResponse{
+		Name:    "shell-adapter",
+		Version: "1.0.0",
+		Examples: []*criteriav2.Example{
+			{
+				Name:        "Lint-and-format",
+				Description: "Run lint, then format the checked-in files",
+				Hcl:         hcl,
+			},
+			{
+				Name: "Hello-world",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	require.True(t, proto.Equal(msg, got))
+	require.Len(t, got.Examples, 2, "both showcased examples must survive the wire")
+
+	first := got.Examples[0]
+	assert.Equal(t, "Lint-and-format", first.Name)
+	assert.Equal(t, "Run lint, then format the checked-in files", first.Description)
+	assert.Equal(t, hcl, first.Hcl,
+		"hcl is warranteed authored content and must round-trip byte-faithfully")
+
+	second := got.Examples[1]
+	assert.Equal(t, "Hello-world", second.Name)
+	assert.Empty(t, second.Description)
+	assert.Empty(t, second.Hcl,
+		"a minimal example (name only) must survive the wire unchanged")
+
+	absent := roundTrip(t, &criteriav2.InfoResponse{Name: "bare"})
+	assert.Empty(t, absent.Examples,
+		"an absent examples list must stay absent — today's behavior for adapters that ship none")
+}
+
+// TestInfoResponse_Examples_WireFieldNumbers pins the KB-176 wire contract:
+// InfoResponse.examples is field 19 (immediately after state=18), and
+// Example carries name(1), description(2), hcl(3).  The field must land on
+// the wire BEFORE the downstream SDK pins (KB-177a / KB-178a / KB-179a)
+// consume a settled reference, so these numbers are part of the contract.
+func TestInfoResponse_Examples_WireFieldNumbers(t *testing.T) {
+	fd := criteriav2.File_criteria_v2_adapter_proto
+	require.NotNil(t, fd, "adapter proto descriptor must be registered")
+
+	infoDesc := fd.Messages().ByName("InfoResponse")
+	require.NotNil(t, infoDesc)
+	examples := infoDesc.Fields().ByName("examples")
+	require.NotNil(t, examples, "InfoResponse.examples must exist on the wire")
+	assert.Equal(t, protoreflect.FieldNumber(19), examples.Number(), "InfoResponse.examples must be field 19")
+	assert.True(t, examples.IsList(), "InfoResponse.examples must be a repeated field")
+	state := infoDesc.Fields().ByName("state")
+	require.NotNil(t, state)
+	assert.Equal(t, protoreflect.FieldNumber(18), state.Number(),
+		"examples must be the next free field after state")
+
+	exampleDesc := fd.Messages().ByName("Example")
+	require.NotNil(t, exampleDesc)
+	assert.Equal(t, protoreflect.FieldNumber(1), exampleDesc.Fields().ByName("name").Number())
+	assert.Equal(t, protoreflect.FieldNumber(2), exampleDesc.Fields().ByName("description").Number())
+	assert.Equal(t, protoreflect.FieldNumber(3), exampleDesc.Fields().ByName("hcl").Number())
+}
+
+// TestInfoResponse_Examples_WireBytes pins the encoded shape and the KB-176
+// additivity acceptance criterion.  On the wire, each examples entry is tag
+// 19 / wire type 2 (length-delimited).  Removing every field-19 entry —
+// exactly what an "old host" does when it skips an unknown field — must (a)
+// leave a message that decodes cleanly with all pre-carrier fields intact,
+// and (b) re-encode byte-identically when the entry is re-appended, proving
+// the additive bytes are self-contained and independent.  The entry payload
+// itself must decode as an Example, so the inner shape is pinned too.
+func TestInfoResponse_Examples_WireBytes(t *testing.T) {
+	const exampleHcl = `step "review" "lint" { adapter = "shell" run = "true" }`
+	example := &criteriav2.Example{
+		Name:        "Lint-and-format",
+		Description: "Run lint, then format the checked-in files",
+		Hcl:         exampleHcl,
+	}
+	msg := &criteriav2.InfoResponse{Name: "shell-adapter", Examples: []*criteriav2.Example{example}}
+	b, err := proto.Marshal(msg)
+	require.NoError(t, err)
+
+	// Wire shape: field 19 must appear on the wire, length-delimited; capture
+	// the full entry (tag + length prefix + payload) for the strip/restore check.
+	var entry19 []byte
+	rest := b
+	for len(rest) > 0 && entry19 == nil {
+		num, typ, n := protowire.ConsumeField(rest)
+		require.NoError(t, protowire.ParseError(n), "encoded InfoResponse must stay parseable")
+		if num == 19 {
+			assert.Equal(t, protowire.BytesType, typ,
+				"a repeated message field must be encoded length-delimited (wire type 2)")
+			entry19 = rest[:n]
+		}
+		rest = rest[n:]
+	}
+	require.NotNil(t, entry19, "encoded InfoResponse must carry examples as field 19")
+
+	// Old-host behavior: strip field 19 the way a reader that does not know
+	// the field does, then decode.  The pre-carrier fields must be intact.
+	without19 := make([]byte, 0, len(b))
+	rest = b
+	for len(rest) > 0 {
+		_, _, n := protowire.ConsumeField(rest)
+		require.NoError(t, protowire.ParseError(n))
+		if !bytes.Equal(rest[:n], entry19) {
+			without19 = append(without19, rest[:n]...)
+		}
+		rest = rest[n:]
+	}
+	old := &criteriav2.InfoResponse{}
+	require.NoError(t, proto.Unmarshal(without19, old),
+		"an old host must decode the bytes with field 19 stripped cleanly")
+	assert.Equal(t, "shell-adapter", old.Name, "pre-carrier fields must survive the skip")
+	assert.Empty(t, old.Examples, "an old host sees no examples")
+	assert.Empty(t, old.GetState(), "no other carrier field may appear")
+
+	// Entry payload shape: the length-delimited bytes of field 19 must decode
+	// exactly as the Example that was marshaled.
+	_, _, tagLen := protowire.ConsumeTag(entry19)
+	require.NoError(t, protowire.ParseError(tagLen))
+	varint, varintLen := protowire.ConsumeVarint(entry19[tagLen:])
+	require.NoError(t, protowire.ParseError(varintLen))
+	payloadBytes := entry19[tagLen+varintLen:]
+	require.Len(t, payloadBytes, int(varint), "entry length prefix must match payload")
+	gotExample := &criteriav2.Example{}
+	require.NoError(t, proto.Unmarshal(payloadBytes, gotExample),
+		"the field-19 payload must decode as an Example")
+	require.True(t, proto.Equal(example, gotExample),
+		"the field-19 payload must be byte-compatible with the Example wire type")
+
+	// Self-containment: re-appending the stripped entry must rebuild the
+	// original encoding byte-for-byte.
+	assert.Equal(t, append(without19, entry19...), b,
+		"the additive field-19 bytes must be independent of the pre-carrier encoding")
 }
 
 // TestInfoResponse_Capabilities_AdapterTools_RoundTrip asserts the CRI-153
