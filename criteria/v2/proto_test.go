@@ -225,12 +225,6 @@ func TestInfoResponse_State_WireFieldNumbers(t *testing.T) {
 	assert.Equal(t, protoreflect.FieldNumber(4), descDesc.Fields().ByName("granularity").Number())
 }
 
-// TestInfoResponse_Capabilities_AdapterTools_RoundTrip asserts the CRI-153
-// capability vocabulary: adapters declare tool-call support with the
-// "adapter_tools" capability string in InfoResponse.capabilities, and the
-// string must survive the wire round-trip — both alongside the other
-// well-known values and on its own. Unknown capability strings are free-form
-// vocabulary, not enum values, so they round-trip unchanged too.
 // TestInfoResponse_Examples_RoundTrip asserts the KB-176 showcase contract:
 // InfoResponse.examples carries authored Example entries (name, description,
 // hcl) and they survive the proto wire round-trip unchanged.  An absent list
@@ -377,6 +371,12 @@ func TestInfoResponse_Examples_WireBytes(t *testing.T) {
 		"the additive field-19 bytes must be independent of the pre-carrier encoding")
 }
 
+// TestInfoResponse_Capabilities_AdapterTools_RoundTrip asserts the CRI-153
+// capability vocabulary: adapters declare tool-call support with the
+// "adapter_tools" capability string in InfoResponse.capabilities, and the
+// string must survive the wire round-trip — both alongside the other
+// well-known values and on its own. Unknown capability strings are free-form
+// vocabulary, not enum values, so they round-trip unchanged too.
 func TestInfoResponse_Capabilities_AdapterTools_RoundTrip(t *testing.T) {
 	msg := &criteriav2.InfoResponse{
 		Name:         "test-adapter",
