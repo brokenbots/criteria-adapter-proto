@@ -1,6 +1,6 @@
 module github.com/brokenbots/criteria-adapter-proto
 
-go 1.26.9
+go 1.26.11
 
 require (
 	github.com/stretchr/testify v1.11.1
