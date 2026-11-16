@@ -1,0 +1,33 @@
+{
+  "name": "fallback contract fires when the step never finalized",
+  "phases": [
+    {
+      "expect": {
+        "accepted": true,
+        "forwarded": {
+          "outcome": "failed"
+        },
+        "issues": []
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [
+          {
+            "name": "completed",
+            "schemaJson": "eyJ0eXBlIjoib2JqZWN0IiwicmVxdWlyZWQiOlsic3VtbWFyeSIsImV4aXRfY29kZSJdLCJwcm9wZXJ0aWVzIjp7InN1bW1hcnkiOnsidHlwZSI6InN0cmluZyJ9LCJleGl0X2NvZGUiOnsidHlwZSI6Im51bWJlciJ9fX0="
+          },
+          {
+            "fallback": true,
+            "name": "failed"
+          }
+        ],
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": []
+    }
+  ]
+}

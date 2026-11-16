@@ -1,10 +1,12 @@
 package criteriav2_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -66,6 +68,9 @@ func TestInfoResponse_RoundTrip(t *testing.T) {
 		ContainerImage:         "ghcr.io/example/adapter:latest",
 		SupportedFeatures:      []string{"pause", "snapshot"},
 		MaxChunkBytes:          1024 * 1024,
+		Tools: []*criteriav2.ToolInfo{
+			{Name: "search", Description: "Search the web"},
+		},
 	}
 	got := roundTrip(t, msg)
 	assert.True(t, proto.Equal(msg, got))
@@ -78,6 +83,322 @@ func TestInfoResponse_SupportedFeatures_ForwardCompat(t *testing.T) {
 	}
 	got := roundTrip(t, msg)
 	require.Equal(t, msg.SupportedFeatures, got.SupportedFeatures)
+}
+
+// TestInfoResponse_Tools_RoundTrip asserts the CRI-171 dynamic tool discovery
+// contract: InfoResponse.tools carries ToolInfo entries (name, description,
+// optional args_schema_json) and they survive the proto wire round-trip
+// unchanged.  Dynamic-tools adapters (mcp, CRI-172) populate the list from
+// tools/list at OpenSession; static-tools adapters MAY populate it, and the
+// compiler consumes it when present for the static name check (CRI-173
+// upgrade path) — so the wire shape must be stable.
+func TestInfoResponse_Tools_RoundTrip(t *testing.T) {
+	const searchSchema = `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`
+	msg := &criteriav2.InfoResponse{
+		Name:    "mcp-adapter",
+		Version: "1.0.0",
+		Tools: []*criteriav2.ToolInfo{
+			{
+				Name:           "search",
+				Description:    "Search the web",
+				ArgsSchemaJson: proto.String(searchSchema),
+			},
+			{
+				Name:        "ping",
+				Description: "No-argument tool",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	require.True(t, proto.Equal(msg, got))
+	require.Len(t, got.Tools, 2, "both advertised tools must survive the wire")
+
+	first := got.Tools[0]
+	assert.Equal(t, "search", first.Name)
+	assert.Equal(t, "Search the web", first.Description)
+	require.NotNil(t, first.ArgsSchemaJson)
+	assert.Equal(t, searchSchema, *first.ArgsSchemaJson,
+		"args_schema_json is a JSON-schema sketch and must round-trip byte-faithfully")
+
+	second := got.Tools[1]
+	assert.Equal(t, "ping", second.Name)
+	assert.Equal(t, "No-argument tool", second.Description)
+	assert.Nil(t, second.ArgsSchemaJson,
+		"args_schema_json is optional; absent must stay absent across the wire")
+}
+
+// TestInfoResponse_Tools_WireFieldNumbers pins the CRI-171 wire contract:
+// InfoResponse.tools is field 17 (immediately after max_chunk_bytes=16), and
+// ToolInfo carries name(1), description(2), args_schema_json(3).  The field
+// must land on the wire BEFORE the compiler consumes the advertised list for
+// the CRI-173 static name check, so these numbers are part of the contract.
+func TestInfoResponse_Tools_WireFieldNumbers(t *testing.T) {
+	fd := criteriav2.File_criteria_v2_adapter_proto
+	require.NotNil(t, fd, "adapter proto descriptor must be registered")
+
+	infoDesc := fd.Messages().ByName("InfoResponse")
+	require.NotNil(t, infoDesc)
+	tools := infoDesc.Fields().ByName("tools")
+	require.NotNil(t, tools, "InfoResponse.tools must exist on the wire")
+	assert.Equal(t, protoreflect.FieldNumber(17), tools.Number(), "InfoResponse.tools must be field 17")
+	assert.True(t, tools.IsList(), "InfoResponse.tools must be a repeated field")
+	maxChunk := infoDesc.Fields().ByName("max_chunk_bytes")
+	require.NotNil(t, maxChunk)
+	assert.Equal(t, protoreflect.FieldNumber(16), maxChunk.Number(),
+		"tools must be next free field after max_chunk_bytes")
+
+	toolInfoDesc := fd.Messages().ByName("ToolInfo")
+	require.NotNil(t, toolInfoDesc)
+	assert.Equal(t, protoreflect.FieldNumber(1), toolInfoDesc.Fields().ByName("name").Number())
+	assert.Equal(t, protoreflect.FieldNumber(2), toolInfoDesc.Fields().ByName("description").Number())
+	schema := toolInfoDesc.Fields().ByName("args_schema_json")
+	require.NotNil(t, schema)
+	assert.Equal(t, protoreflect.FieldNumber(3), schema.Number())
+	assert.True(t, schema.HasPresence(),
+		"args_schema_json must be explicitly optional (presence-tracking)")
+}
+
+// TestInfoResponse_State_RoundTrip asserts the CRI-201 checkpoint contract:
+// InfoResponse.state carries a StateDescriptor (mode, schema, max_bytes,
+// granularity) and it survives the proto wire round-trip unchanged.  An
+// absent descriptor must stay absent (adapters without a declaration behave
+// exactly as before — mode "none"), and all three modes plus an unknown
+// future mode value are free-form strings that must round-trip byte-faithfully.
+func TestInfoResponse_State_RoundTrip(t *testing.T) {
+	blob := &criteriav2.InfoResponse{
+		Name:    "transcript-adapter",
+		Version: "1.0.0",
+		State: &criteriav2.StateDescriptor{
+			Mode:        "blob",
+			Schema:      "transcript.v1",
+			MaxBytes:    400 * 1024,
+			Granularity: "per-turn",
+		},
+	}
+	got := roundTrip(t, blob)
+	require.True(t, proto.Equal(blob, got))
+	require.NotNil(t, got.State, "a declared state must survive the wire")
+	assert.Equal(t, "blob", got.State.GetMode())
+	assert.Equal(t, "transcript.v1", got.State.GetSchema(),
+		"schema is the adapter-defined version tag and must round-trip byte-faithfully")
+	assert.Equal(t, uint32(400*1024), got.State.GetMaxBytes())
+	assert.Equal(t, "per-turn", got.State.GetGranularity())
+
+	for _, mode := range []string{"", "none", "ref", "some_future_mode_xyz"} {
+		msg := &criteriav2.InfoResponse{State: &criteriav2.StateDescriptor{Mode: mode}}
+		got := roundTrip(t, msg)
+		require.True(t, proto.Equal(msg, got), "mode %q must round-trip unchanged", mode)
+	}
+
+	absent := roundTrip(t, &criteriav2.InfoResponse{Name: "bare"})
+	assert.Nil(t, absent.GetState(),
+		"an absent declaration must stay absent — mode none is today's behavior")
+}
+
+// TestInfoResponse_State_WireFieldNumbers pins the CRI-201 wire contract:
+// InfoResponse.state is field 18 (immediately after tools=17), and
+// StateDescriptor carries mode(1), schema(2), max_bytes(3), granularity(4).
+// The field must land on the wire BEFORE the engine starts consuming the
+// declaration for checkpointing (CRI-202), so these numbers are part of the
+// contract.
+func TestInfoResponse_State_WireFieldNumbers(t *testing.T) {
+	fd := criteriav2.File_criteria_v2_adapter_proto
+	require.NotNil(t, fd, "adapter proto descriptor must be registered")
+
+	infoDesc := fd.Messages().ByName("InfoResponse")
+	require.NotNil(t, infoDesc)
+	state := infoDesc.Fields().ByName("state")
+	require.NotNil(t, state, "InfoResponse.state must exist on the wire")
+	assert.Equal(t, protoreflect.FieldNumber(18), state.Number(), "InfoResponse.state must be field 18")
+	assert.True(t, state.HasPresence(),
+		"InfoResponse.state must be an optional message field (presence-tracking)")
+	tools := infoDesc.Fields().ByName("tools")
+	require.NotNil(t, tools)
+	assert.Equal(t, protoreflect.FieldNumber(17), tools.Number(),
+		"state must be the next free field after tools")
+
+	descDesc := fd.Messages().ByName("StateDescriptor")
+	require.NotNil(t, descDesc)
+	assert.Equal(t, protoreflect.FieldNumber(1), descDesc.Fields().ByName("mode").Number())
+	assert.Equal(t, protoreflect.FieldNumber(2), descDesc.Fields().ByName("schema").Number())
+	assert.Equal(t, protoreflect.FieldNumber(3), descDesc.Fields().ByName("max_bytes").Number())
+	assert.Equal(t, protoreflect.FieldNumber(4), descDesc.Fields().ByName("granularity").Number())
+}
+
+// TestInfoResponse_Examples_RoundTrip asserts the KB-176 showcase contract:
+// InfoResponse.examples carries authored Example entries (name, description,
+// hcl) and they survive the proto wire round-trip unchanged.  An absent list
+// must stay absent — an adapter that ships no examples behaves exactly as
+// before, byte-for-byte (the change is additive; an old host ignores field 19
+// as an unknown field per proto3 semantics).  Each hcl fragment is a
+// complete, valid criteria workflow body fragment the author warrants, so it
+// must round-trip byte-faithfully.
+func TestInfoResponse_Examples_RoundTrip(t *testing.T) {
+	hcl := `step "review" "lint" { adapter = "shell" run = "true" }`
+	msg := &criteriav2.InfoResponse{
+		Name:    "shell-adapter",
+		Version: "1.0.0",
+		Examples: []*criteriav2.Example{
+			{
+				Name:        "Lint-and-format",
+				Description: "Run lint, then format the checked-in files",
+				Hcl:         hcl,
+			},
+			{
+				Name: "Hello-world",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	require.True(t, proto.Equal(msg, got))
+	require.Len(t, got.Examples, 2, "both showcased examples must survive the wire")
+
+	first := got.Examples[0]
+	assert.Equal(t, "Lint-and-format", first.Name)
+	assert.Equal(t, "Run lint, then format the checked-in files", first.Description)
+	assert.Equal(t, hcl, first.Hcl,
+		"hcl is warranteed authored content and must round-trip byte-faithfully")
+
+	second := got.Examples[1]
+	assert.Equal(t, "Hello-world", second.Name)
+	assert.Empty(t, second.Description)
+	assert.Empty(t, second.Hcl,
+		"a minimal example (name only) must survive the wire unchanged")
+
+	absent := roundTrip(t, &criteriav2.InfoResponse{Name: "bare"})
+	assert.Empty(t, absent.Examples,
+		"an absent examples list must stay absent — today's behavior for adapters that ship none")
+}
+
+// TestInfoResponse_Examples_WireFieldNumbers pins the KB-176 wire contract:
+// InfoResponse.examples is field 19 (immediately after state=18), and
+// Example carries name(1), description(2), hcl(3).  The field must land on
+// the wire BEFORE the downstream SDK pins (KB-177a / KB-178a / KB-179a)
+// consume a settled reference, so these numbers are part of the contract.
+func TestInfoResponse_Examples_WireFieldNumbers(t *testing.T) {
+	fd := criteriav2.File_criteria_v2_adapter_proto
+	require.NotNil(t, fd, "adapter proto descriptor must be registered")
+
+	infoDesc := fd.Messages().ByName("InfoResponse")
+	require.NotNil(t, infoDesc)
+	examples := infoDesc.Fields().ByName("examples")
+	require.NotNil(t, examples, "InfoResponse.examples must exist on the wire")
+	assert.Equal(t, protoreflect.FieldNumber(19), examples.Number(), "InfoResponse.examples must be field 19")
+	assert.True(t, examples.IsList(), "InfoResponse.examples must be a repeated field")
+	state := infoDesc.Fields().ByName("state")
+	require.NotNil(t, state)
+	assert.Equal(t, protoreflect.FieldNumber(18), state.Number(),
+		"examples must be the next free field after state")
+
+	exampleDesc := fd.Messages().ByName("Example")
+	require.NotNil(t, exampleDesc)
+	assert.Equal(t, protoreflect.FieldNumber(1), exampleDesc.Fields().ByName("name").Number())
+	assert.Equal(t, protoreflect.FieldNumber(2), exampleDesc.Fields().ByName("description").Number())
+	assert.Equal(t, protoreflect.FieldNumber(3), exampleDesc.Fields().ByName("hcl").Number())
+}
+
+// TestInfoResponse_Examples_WireBytes pins the encoded shape and the KB-176
+// additivity acceptance criterion.  On the wire, each examples entry is tag
+// 19 / wire type 2 (length-delimited).  Removing every field-19 entry —
+// exactly what an "old host" does when it skips an unknown field — must (a)
+// leave a message that decodes cleanly with all pre-carrier fields intact,
+// and (b) re-encode byte-identically when the entry is re-appended, proving
+// the additive bytes are self-contained and independent.  The entry payload
+// itself must decode as an Example, so the inner shape is pinned too.
+func TestInfoResponse_Examples_WireBytes(t *testing.T) {
+	const exampleHcl = `step "review" "lint" { adapter = "shell" run = "true" }`
+	example := &criteriav2.Example{
+		Name:        "Lint-and-format",
+		Description: "Run lint, then format the checked-in files",
+		Hcl:         exampleHcl,
+	}
+	msg := &criteriav2.InfoResponse{Name: "shell-adapter", Examples: []*criteriav2.Example{example}}
+	b, err := proto.Marshal(msg)
+	require.NoError(t, err)
+
+	// Wire shape: field 19 must appear on the wire, length-delimited; capture
+	// the full entry (tag + length prefix + payload) for the strip/restore check.
+	var entry19 []byte
+	rest := b
+	for len(rest) > 0 && entry19 == nil {
+		num, typ, n := protowire.ConsumeField(rest)
+		require.NoError(t, protowire.ParseError(n), "encoded InfoResponse must stay parseable")
+		if num == 19 {
+			assert.Equal(t, protowire.BytesType, typ,
+				"a repeated message field must be encoded length-delimited (wire type 2)")
+			entry19 = rest[:n]
+		}
+		rest = rest[n:]
+	}
+	require.NotNil(t, entry19, "encoded InfoResponse must carry examples as field 19")
+
+	// Old-host behavior: strip field 19 the way a reader that does not know
+	// the field does, then decode.  The pre-carrier fields must be intact.
+	without19 := make([]byte, 0, len(b))
+	rest = b
+	for len(rest) > 0 {
+		_, _, n := protowire.ConsumeField(rest)
+		require.NoError(t, protowire.ParseError(n))
+		if !bytes.Equal(rest[:n], entry19) {
+			without19 = append(without19, rest[:n]...)
+		}
+		rest = rest[n:]
+	}
+	old := &criteriav2.InfoResponse{}
+	require.NoError(t, proto.Unmarshal(without19, old),
+		"an old host must decode the bytes with field 19 stripped cleanly")
+	assert.Equal(t, "shell-adapter", old.Name, "pre-carrier fields must survive the skip")
+	assert.Empty(t, old.Examples, "an old host sees no examples")
+	assert.Empty(t, old.GetState(), "no other carrier field may appear")
+
+	// Entry payload shape: the length-delimited bytes of field 19 must decode
+	// exactly as the Example that was marshaled.
+	_, _, tagLen := protowire.ConsumeTag(entry19)
+	require.NoError(t, protowire.ParseError(tagLen))
+	varint, varintLen := protowire.ConsumeVarint(entry19[tagLen:])
+	require.NoError(t, protowire.ParseError(varintLen))
+	payloadBytes := entry19[tagLen+varintLen:]
+	require.Len(t, payloadBytes, int(varint), "entry length prefix must match payload")
+	gotExample := &criteriav2.Example{}
+	require.NoError(t, proto.Unmarshal(payloadBytes, gotExample),
+		"the field-19 payload must decode as an Example")
+	require.True(t, proto.Equal(example, gotExample),
+		"the field-19 payload must be byte-compatible with the Example wire type")
+
+	// Self-containment: re-appending the stripped entry must rebuild the
+	// original encoding byte-for-byte.
+	assert.Equal(t, append(without19, entry19...), b,
+		"the additive field-19 bytes must be independent of the pre-carrier encoding")
+}
+
+// TestInfoResponse_Capabilities_AdapterTools_RoundTrip asserts the CRI-153
+// capability vocabulary: adapters declare tool-call support with the
+// "adapter_tools" capability string in InfoResponse.capabilities, and the
+// string must survive the wire round-trip — both alongside the other
+// well-known values and on its own. Unknown capability strings are free-form
+// vocabulary, not enum values, so they round-trip unchanged too.
+func TestInfoResponse_Capabilities_AdapterTools_RoundTrip(t *testing.T) {
+	msg := &criteriav2.InfoResponse{
+		Name:         "test-adapter",
+		Version:      "1.0.0",
+		Capabilities: []string{"parallel_safe", "adapter_tools"},
+	}
+	got := roundTrip(t, msg)
+	require.True(t, proto.Equal(msg, got))
+	assert.Equal(t, []string{"parallel_safe", "adapter_tools"}, got.Capabilities,
+		"well-known capability values must survive the InfoResponse round-trip")
+	assert.Contains(t, got.Capabilities, "adapter_tools",
+		"the adapter_tools capability string must round-trip through InfoResponse")
+
+	solo := &criteriav2.InfoResponse{Capabilities: []string{"adapter_tools"}}
+	gotSolo := roundTrip(t, solo)
+	require.True(t, proto.Equal(solo, gotSolo))
+	assert.Equal(t, []string{"adapter_tools"}, gotSolo.Capabilities)
+
+	future := &criteriav2.InfoResponse{Capabilities: []string{"some_future_capability_xyz"}}
+	gotFuture := roundTrip(t, future)
+	require.Equal(t, []string{"some_future_capability_xyz"}, gotFuture.Capabilities,
+		"unknown capability values are free-form and must round-trip unchanged")
 }
 
 // ─── OpenSession ─────────────────────────────────────────────────────────────
@@ -254,6 +575,246 @@ func TestPermissionEvent_CancelVariant_RoundTrip(t *testing.T) {
 	}
 	got := roundTrip(t, msg)
 	assert.True(t, proto.Equal(msg, got))
+}
+
+// TestPermissionEvent_ToolCallResult_Success_RoundTrip round-trips a granted
+// adapter tool call answered with its callee result: request_id correlates
+// with the caller's permission.request payload, and outcome + outputs_json
+// carry the callee's data.
+func TestPermissionEvent_ToolCallResult_Success_RoundTrip(t *testing.T) {
+	msg := &criteriav2.PermissionEvent{
+		Event: &criteriav2.PermissionEvent_ToolCallResult{
+			ToolCallResult: &criteriav2.ToolCallResult{
+				RequestId: "call-1",
+				Outcome:   "success",
+				OutputsJson: []byte(
+					`{"issue_url":"https://github.com/octo/repo/issues/1","number":1}`),
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	assert.True(t, proto.Equal(msg, got))
+
+	res := got.GetToolCallResult()
+	require.NotNil(t, res, "tool_call_result oneof member must survive the round trip")
+	assert.Equal(t, "call-1", res.RequestId)
+	assert.Equal(t, "success", res.Outcome)
+	assert.Empty(t, res.CallError, "success result must not carry a typed failure")
+	assert.JSONEq(t, `{"issue_url":"https://github.com/octo/repo/issues/1","number":1}`, string(res.OutputsJson))
+}
+
+// TestPermissionEvent_ToolCallResult_ChunkedOutputs_RoundTrip proves the
+// chunked encoding for ToolCallResult.outputs_json: the whole object is split
+// into fragment PermissionEvent messages (Chunk framing reused verbatim from
+// ExecuteResult), each fragment is proto-marshalled and unmarshalled as it
+// would arrive on the Permissions stream, and the callee's outputs are
+// reconstructable from those messages alone.
+func TestPermissionEvent_ToolCallResult_ChunkedOutputs_RoundTrip(t *testing.T) {
+	originalOutputs := map[string]any{
+		"issue_url": "https://github.com/octo/repo/issues/1",
+		"number":    1,
+		"labels":    []string{"bug", "help wanted"},
+	}
+	outputsJSON, err := json.Marshal(originalOutputs)
+	require.NoError(t, err)
+
+	const chunkSize = 12
+	base := &criteriav2.ToolCallResult{RequestId: "call-1", Outcome: "success"}
+	fragments := criteriav2.ChunkToolCallResultOutputs(base, outputsJSON, chunkSize)
+	require.Greater(t, len(fragments), 1, "outputs must be split into multiple fragments")
+
+	events := make([]*criteriav2.ToolCallResult, len(fragments))
+	for i, frag := range fragments {
+		ev := &criteriav2.PermissionEvent{
+			Event: &criteriav2.PermissionEvent_ToolCallResult{ToolCallResult: frag},
+		}
+		var decoded criteriav2.PermissionEvent
+		b, merr := proto.Marshal(ev)
+		require.NoError(t, merr)
+		require.NoError(t, proto.Unmarshal(b, &decoded))
+
+		res := decoded.GetToolCallResult()
+		require.NotNilf(t, res, "fragment[%d] must survive the round trip", i)
+		require.NotNilf(t, res.Chunk, "fragment[%d] must carry Chunk metadata", i)
+		assert.Equal(t, uint32(i), res.Chunk.Seq)
+		assert.Equal(t, uint32(len(fragments)), res.Chunk.Total)
+		assert.Equal(t, i == len(fragments)-1, res.Chunk.Final, "only the last fragment sets final")
+		assert.Equal(t, base.RequestId, res.RequestId, "request_id is preserved on every fragment")
+		events[i] = res
+	}
+
+	joined, jerr := criteriav2.JoinToolCallResultOutputs(events)
+	require.NoError(t, jerr)
+
+	var gotOutputs map[string]any
+	require.NoError(t, json.Unmarshal(joined, &gotOutputs))
+	assert.Len(t, gotOutputs, len(originalOutputs))
+	assert.Equal(t, "https://github.com/octo/repo/issues/1", gotOutputs["issue_url"])
+}
+
+// TestPermissionEvent_ToolCallResult_TypedFailure_RoundTrip round-trips a
+// call_error-only result: non-empty call_error means typed failure, so
+// outcome and outputs_json are meaningless (unset here, and SDKs must ignore
+// them even when present).
+func TestPermissionEvent_ToolCallResult_TypedFailure_RoundTrip(t *testing.T) {
+	msg := &criteriav2.PermissionEvent{
+		Event: &criteriav2.PermissionEvent_ToolCallResult{
+			ToolCallResult: &criteriav2.ToolCallResult{
+				RequestId: "call-2",
+				CallError: "unknown_tool",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	assert.True(t, proto.Equal(msg, got))
+
+	res := got.GetToolCallResult()
+	require.NotNil(t, res)
+	assert.Equal(t, "unknown_tool", res.CallError)
+	assert.Empty(t, res.Outcome, "typed failure must not carry an outcome")
+	assert.Nil(t, res.Chunk, "typed failure must not carry chunk framing")
+	assert.Nil(t, res.OutputsJson, "typed failure must not carry outputs")
+}
+
+// TestPermissionEvent_ToolCallResult_UnknownCallErrorRoundTrips verifies the
+// call_error registry is free-form: values added after this SDK's release
+// must round-trip unchanged so newer hosts degrade gracefully.
+func TestPermissionEvent_ToolCallResult_UnknownCallErrorRoundTrips(t *testing.T) {
+	msg := &criteriav2.PermissionEvent{
+		Event: &criteriav2.PermissionEvent_ToolCallResult{
+			ToolCallResult: &criteriav2.ToolCallResult{
+				RequestId: "call-3",
+				CallError: "some_future_error_code",
+			},
+		},
+	}
+	got := roundTrip(t, msg)
+	assert.True(t, proto.Equal(msg, got))
+	assert.Equal(t, "some_future_error_code", got.GetToolCallResult().CallError)
+}
+
+// TestToolCallResult_WellKnownCallErrorValues pins the well-known call_error
+// registry documented on the proto message so SDK switch statements and
+// host constants stay aligned.
+func TestToolCallResult_WellKnownCallErrorValues(t *testing.T) {
+	wellKnown := []string{
+		"unknown_adapter", "unknown_tool", "capability_missing",
+		"host_unsupported", "depth_exceeded", "cycle_detected",
+		"callee_crash", "callee_timeout", "canceled",
+		"not_yet_supported", "self_call",
+	}
+	for _, v := range wellKnown {
+		res := &criteriav2.ToolCallResult{RequestId: "r", CallError: v}
+		got := roundTrip(t, res)
+		assert.Equal(t, v, got.CallError, "call_error value %q must round-trip", v)
+	}
+}
+
+// TestPermissionEvent_OneofRoundTrip_ExactFieldValues proves the CRI-154
+// oneof round-trip contract: every PermissionEvent member — request, cancel,
+// and tool_call_result (in its success, chunked, and typed-failure shapes) —
+// decodes with the exact field values that were sent, and exactly one member
+// is set on the decoded event (the siblings stay nil).
+func TestPermissionEvent_OneofRoundTrip_ExactFieldValues(t *testing.T) {
+	tests := []struct {
+		name string
+		send *criteriav2.PermissionEvent
+	}{
+		{
+			name: "request carries all PermissionRequest fields",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_Request{
+				Request: &criteriav2.PermissionRequest{
+					RequestId:   "req-1",
+					Tool:        "create_issue",
+					ArgsDigest:  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+					ArgsPreview: `{"title":"Found a bug"}`,
+				},
+			}},
+		},
+		{
+			name: "cancel carries both PermissionCancel fields",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_Cancel{
+				Cancel: &criteriav2.PermissionCancel{
+					RequestId: "req-2",
+					Reason:    "no matching allow_tools entry",
+				},
+			}},
+		},
+		{
+			name: "tool_call_result success, unchunked",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_ToolCallResult{
+				ToolCallResult: &criteriav2.ToolCallResult{
+					RequestId:   "call-1",
+					Outcome:     "success",
+					OutputsJson: []byte(`{"issue_url":"https://github.com/octocat/hello-world/issues/1","number":1}`),
+				},
+			}},
+		},
+		{
+			name: "tool_call_result success, mid-stream chunk fragment",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_ToolCallResult{
+				ToolCallResult: &criteriav2.ToolCallResult{
+					RequestId:   "call-1",
+					Outcome:     "success",
+					Chunk:       &criteriav2.Chunk{Seq: 1, Total: 3, Final: false},
+					OutputsJson: []byte(`ue":"https://github.com/octocat/hello-world/issues/1"`),
+				},
+			}},
+		},
+		{
+			name: "tool_call_result typed failure",
+			send: &criteriav2.PermissionEvent{Event: &criteriav2.PermissionEvent_ToolCallResult{
+				ToolCallResult: &criteriav2.ToolCallResult{
+					RequestId: "call-2",
+					CallError: "callee_timeout",
+				},
+			}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := roundTrip(t, tc.send)
+
+			// The exact member that was sent survives; its siblings do not.
+			switch want := tc.send.Event.(type) {
+			case *criteriav2.PermissionEvent_Request:
+				assert.Nil(t, got.GetCancel(), "cancel must not be set")
+				assert.Nil(t, got.GetToolCallResult(), "tool_call_result must not be set")
+				gotReq := got.GetRequest()
+				require.NotNil(t, gotReq, "request member must survive the round trip")
+				assert.Equal(t, want.Request.RequestId, gotReq.RequestId)
+				assert.Equal(t, want.Request.Tool, gotReq.Tool)
+				assert.Equal(t, want.Request.ArgsDigest, gotReq.ArgsDigest)
+				assert.Equal(t, want.Request.ArgsPreview, gotReq.ArgsPreview)
+			case *criteriav2.PermissionEvent_Cancel:
+				assert.Nil(t, got.GetRequest(), "request must not be set")
+				assert.Nil(t, got.GetToolCallResult(), "tool_call_result must not be set")
+				gotCancel := got.GetCancel()
+				require.NotNil(t, gotCancel, "cancel member must survive the round trip")
+				assert.Equal(t, want.Cancel.RequestId, gotCancel.RequestId)
+				assert.Equal(t, want.Cancel.Reason, gotCancel.Reason)
+			case *criteriav2.PermissionEvent_ToolCallResult:
+				assert.Nil(t, got.GetRequest(), "request must not be set")
+				assert.Nil(t, got.GetCancel(), "cancel must not be set")
+				gotRes := got.GetToolCallResult()
+				require.NotNil(t, gotRes, "tool_call_result member must survive the round trip")
+				assert.Equal(t, want.ToolCallResult.RequestId, gotRes.RequestId)
+				assert.Equal(t, want.ToolCallResult.Outcome, gotRes.Outcome)
+				assert.Equal(t, want.ToolCallResult.CallError, gotRes.CallError)
+				assert.Equal(t, want.ToolCallResult.OutputsJson, gotRes.OutputsJson)
+				if want.ToolCallResult.Chunk == nil {
+					assert.Nil(t, gotRes.Chunk, "chunk must stay nil when sent unset")
+				} else {
+					require.NotNil(t, gotRes.Chunk, "chunk must survive the round trip")
+					assert.Equal(t, want.ToolCallResult.Chunk.Seq, gotRes.Chunk.Seq)
+					assert.Equal(t, want.ToolCallResult.Chunk.Total, gotRes.Chunk.Total)
+					assert.Equal(t, want.ToolCallResult.Chunk.Final, gotRes.Chunk.Final)
+				}
+			default:
+				t.Fatalf("unhandled oneof member %T", tc.send.Event)
+			}
+		})
+	}
 }
 
 func TestPermissionDecision_RoundTrip(t *testing.T) {
@@ -637,50 +1198,20 @@ func TestReservedFields_PermissionRequest(t *testing.T) {
 // in every message defined in adapter.proto.  Adding a field in this range
 // would break the protocol versioning guarantee (WS02 exit criterion).
 func TestReservedFields_100To999Block(t *testing.T) {
-	// All messages in criteria/v2/adapter.proto must reserve 100 to 999.
-	msgNames := []protoreflect.Name{
-		"Chunk",
-		"Heartbeat",
-		"ConfigFieldProto",
-		"AdapterSchemaProto",
-		"InfoRequest",
-		"InfoResponse",
-		"OpenSessionRequest",
-		"OpenSessionResponse",
-		"CloseSessionRequest",
-		"CloseSessionResponse",
-		"ExecuteRequest",
-		"AdapterEvent",
-		"ToolInvocation",
-		"ExecuteResult",
-		"ExecuteEvent",
-		"LogRequest",
-		"LogEvent",
-		"PermissionRequest",
-		"PermissionCancel",
-		"PermissionEvent",
-		"PermissionDecision",
-		"PauseRequest",
-		"PauseResponse",
-		"ResumeRequest",
-		"ResumeResponse",
-		"SnapshotRequest",
-		"SnapshotResponse",
-		"RestoreRequest",
-		"RestoreResponse",
-		"SnapshotVersionMismatch",
-		"InspectRequest",
-		"InspectField",
-		"InspectResponse",
-	}
-	for _, name := range msgNames {
+	// Every message in criteria/v2/adapter.proto must reserve 100 to 999.
+	// The message set is derived from the compiled descriptor rather than a
+	// hand-maintained list, so a newly added message cannot silently skip
+	// this check.
+	msgs := criteriav2.File_criteria_v2_adapter_proto.Messages()
+	require.Positive(t, msgs.Len(), "adapter.proto must define messages")
+	for i := 0; i < msgs.Len(); i++ {
+		msgDesc := msgs.Get(i)
+		name := msgDesc.FullName().Name()
 		t.Run(string(name), func(t *testing.T) {
-			msgDesc := criteriav2.File_criteria_v2_adapter_proto.Messages().ByName(name)
-			require.NotNilf(t, msgDesc, "message %s not found in adapter.proto", name)
 			found := false
 			ranges := msgDesc.ReservedRanges()
-			for i := 0; i < ranges.Len(); i++ {
-				r := ranges.Get(i)
+			for j := 0; j < ranges.Len(); j++ {
+				r := ranges.Get(j)
 				if r[0] <= 100 && int(r[1]) > 999 {
 					found = true
 				}

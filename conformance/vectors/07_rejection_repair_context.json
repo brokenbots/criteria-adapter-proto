@@ -1,0 +1,76 @@
+{
+  "name": "rejection context rides the next Execute; repair accepted",
+  "phases": [
+    {
+      "expect": {
+        "accepted": false,
+        "issues": [
+          "payload_schema: property \"summary\": expected \"string\", got \"boolean\""
+        ],
+        "rejection": {
+          "attempt": 1,
+          "issues": "payload_schema: property \"summary\": expected \"string\", got \"boolean\"",
+          "outcome": "completed"
+        }
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [
+          {
+            "name": "completed",
+            "schemaJson": "eyJ0eXBlIjoib2JqZWN0IiwicmVxdWlyZWQiOlsic3VtbWFyeSIsImV4aXRfY29kZSJdLCJwcm9wZXJ0aWVzIjp7InN1bW1hcnkiOnsidHlwZSI6InN0cmluZyJ9LCJleGl0X2NvZGUiOnsidHlwZSI6Im51bWJlciJ9fX0="
+          }
+        ],
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": [
+        {
+          "comment": "oops",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5Ijp0cnVlLCJleGl0X2NvZGUiOjB9"
+        }
+      ]
+    },
+    {
+      "expect": {
+        "accepted": true,
+        "forwarded": {
+          "comment": "repaired payload",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5IjoiMyBmaWxlcyBsaW50ZWQiLCJleGl0X2NvZGUiOjB9"
+        },
+        "issues": []
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [
+          {
+            "name": "completed",
+            "schemaJson": "eyJ0eXBlIjoib2JqZWN0IiwicmVxdWlyZWQiOlsic3VtbWFyeSIsImV4aXRfY29kZSJdLCJwcm9wZXJ0aWVzIjp7InN1bW1hcnkiOnsidHlwZSI6InN0cmluZyJ9LCJleGl0X2NvZGUiOnsidHlwZSI6Im51bWJlciJ9fX0="
+          }
+        ],
+        "rejection": {
+          "attempt": 1,
+          "issues": "payload_schema: property \"summary\": expected \"string\", got \"boolean\"",
+          "outcome": "completed"
+        },
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": [
+        {
+          "comment": "repaired payload",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5IjoiMyBmaWxlcyBsaW50ZWQiLCJleGl0X2NvZGUiOjB9"
+        }
+      ]
+    }
+  ]
+}

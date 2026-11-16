@@ -258,6 +258,229 @@ func TestAssembleChunks_EmptyPayload(t *testing.T) {
 	assert.Nil(t, got)
 }
 
+// ─── ToolCallResult chunking ────────────────────────────────────────────────
+
+// TestChunkToolCallResultOutputs_Framing verifies the fragment framing: seq
+// ordering, total, and the final flag, with base fields preserved.
+func TestChunkToolCallResultOutputs_Framing(t *testing.T) {
+	outputsJSON := []byte(`{"k":"v","long":"aaaaaaaaaaaaaaaaaaaaaa"}`)
+	base := &criteriav2.ToolCallResult{RequestId: "call-1", Outcome: "success"}
+
+	fragments := criteriav2.ChunkToolCallResultOutputs(base, outputsJSON, 8)
+	require.Greater(t, len(fragments), 1, "payload must be split into multiple fragments")
+
+	for i, frag := range fragments {
+		assert.Equal(t, base.RequestId, frag.RequestId, "request_id preserved on fragment[%d]", i)
+		assert.Equal(t, base.Outcome, frag.Outcome, "outcome preserved on fragment[%d]", i)
+		require.NotNil(t, frag.Chunk, "fragment[%d] carries framing", i)
+		assert.Equal(t, uint32(i), frag.Chunk.Seq)
+		assert.Equal(t, uint32(len(fragments)), frag.Chunk.Total)
+		assert.Equal(t, i == len(fragments)-1, frag.Chunk.Final)
+	}
+	// Rejoining in order reproduces the original bytes.
+	joined, err := criteriav2.JoinToolCallResultOutputs(fragments)
+	require.NoError(t, err)
+	assert.Equal(t, outputsJSON, joined)
+}
+
+// TestJoinToolCallResultOutputs_InterleavedFragments reflects the Permissions
+// bidi stream: fragments of one call may be delivered out of order, and the
+// SDK's correlation step first selects the fragments by request_id before
+// joining (the joiner rejects mixed request ids).
+func TestJoinToolCallResultOutputs_InterleavedFragments(t *testing.T) {
+	outputsJSON := []byte("0123456789abcdefghij")
+	base := &criteriav2.ToolCallResult{RequestId: "call-1", Outcome: "success"}
+	fragments := criteriav2.ChunkToolCallResultOutputs(base, outputsJSON, 5)
+	require.Greater(t, len(fragments), 1, "payload must be split into multiple fragments")
+
+	// Simulate interleaving on the bidi stream: call-1's fragments delivered
+	// out of order with another call's fragment in between.
+	other := &criteriav2.ToolCallResult{RequestId: "call-2", Outcome: "success"}
+	otherFragments := criteriav2.ChunkToolCallResultOutputs(other, []byte(`{"x":1}`), 1024)
+	require.Len(t, otherFragments, 1)
+
+	streamDelivery := make([]*criteriav2.ToolCallResult, 0, len(fragments)+1)
+	for i := len(fragments) - 1; i >= 0; i-- {
+		streamDelivery = append(streamDelivery, fragments[i])
+		if i == len(fragments)/2 {
+			streamDelivery = append(streamDelivery, otherFragments[0])
+		}
+	}
+
+	// Mixed ids are rejected: a caller must not blindly join everything it
+	// sees on the stream.
+	_, mixedErr := criteriav2.JoinToolCallResultOutputs(streamDelivery)
+	assert.Error(t, mixedErr)
+
+	// The SDK's correlation step: keep only the correlated call's fragments
+	// (here, out of order) and join.
+	var correlated []*criteriav2.ToolCallResult
+	for _, res := range streamDelivery {
+		if res.RequestId == base.RequestId {
+			correlated = append(correlated, res)
+		}
+	}
+	joined, err := criteriav2.JoinToolCallResultOutputs(correlated)
+	require.NoError(t, err)
+	assert.Equal(t, outputsJSON, joined)
+}
+
+// TestJoinToolCallResultOutputs_EmptyInputAndSingleFragment covers the empty
+// input error and the single-fragment path.
+func TestJoinToolCallResultOutputs_EmptyInputAndSingleFragment(t *testing.T) {
+	_, err := criteriav2.JoinToolCallResultOutputs(nil)
+	assert.Error(t, err)
+
+	single := &criteriav2.ToolCallResult{
+		RequestId:   "call-1",
+		Outcome:     "success",
+		Chunk:       &criteriav2.Chunk{Seq: 0, Total: 1, Final: true},
+		OutputsJson: []byte(`{}`),
+	}
+	joined, err := criteriav2.JoinToolCallResultOutputs([]*criteriav2.ToolCallResult{single})
+	require.NoError(t, err)
+	assert.Equal(t, []byte(`{}`), joined)
+}
+
+// TestJoinToolCallResultOutputs_FramingValidation pins the joiner's framing
+// contract for the bidi stream: contiguous seqs from 0, consistent totals,
+// exactly one final chunk at seq total-1.
+func TestJoinToolCallResultOutputs_FramingValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		fragments []*criteriav2.ToolCallResult
+	}{
+		{
+			"missing chunk metadata",
+			[]*criteriav2.ToolCallResult{{RequestId: "r", OutputsJson: []byte("x")}},
+		},
+		{
+			"empty request id",
+			[]*criteriav2.ToolCallResult{
+				{Chunk: &criteriav2.Chunk{Seq: 0, Total: 1, Final: true}, OutputsJson: []byte("a")},
+			},
+		},
+		{
+			"mixed request ids",
+			[]*criteriav2.ToolCallResult{
+				{RequestId: "call-1", Chunk: &criteriav2.Chunk{Seq: 0, Total: 2, Final: false}, OutputsJson: []byte("a")},
+				{RequestId: "call-2", Chunk: &criteriav2.Chunk{Seq: 1, Total: 2, Final: true}, OutputsJson: []byte("b")},
+			},
+		},
+		{
+			"seq gap",
+			[]*criteriav2.ToolCallResult{
+				{Chunk: &criteriav2.Chunk{Seq: 0, Total: 3, Final: false}, OutputsJson: []byte("a")},
+				{Chunk: &criteriav2.Chunk{Seq: 2, Total: 3, Final: true}, OutputsJson: []byte("c")},
+			},
+		},
+		{
+			"mismatched total",
+			[]*criteriav2.ToolCallResult{
+				{Chunk: &criteriav2.Chunk{Seq: 0, Total: 2, Final: false}, OutputsJson: []byte("a")},
+				{Chunk: &criteriav2.Chunk{Seq: 1, Total: 3, Final: true}, OutputsJson: []byte("b")},
+			},
+		},
+		{
+			"declared total larger than received",
+			[]*criteriav2.ToolCallResult{
+				{Chunk: &criteriav2.Chunk{Seq: 0, Total: 3, Final: false}, OutputsJson: []byte("a")},
+				{Chunk: &criteriav2.Chunk{Seq: 1, Total: 3, Final: true}, OutputsJson: []byte("b")},
+			},
+		},
+		{
+			"final flag missing",
+			[]*criteriav2.ToolCallResult{
+				{Chunk: &criteriav2.Chunk{Seq: 0, Total: 2, Final: false}, OutputsJson: []byte("a")},
+				{Chunk: &criteriav2.Chunk{Seq: 1, Total: 2, Final: false}, OutputsJson: []byte("b")},
+			},
+		},
+		{
+			"final flag set early",
+			[]*criteriav2.ToolCallResult{
+				{Chunk: &criteriav2.Chunk{Seq: 0, Total: 3, Final: true}, OutputsJson: []byte("a")},
+				{Chunk: &criteriav2.Chunk{Seq: 1, Total: 3, Final: false}, OutputsJson: []byte("b")},
+				{Chunk: &criteriav2.Chunk{Seq: 2, Total: 3, Final: false}, OutputsJson: []byte("c")},
+			},
+		},
+		{
+			"zero total declared",
+			[]*criteriav2.ToolCallResult{{Chunk: &criteriav2.Chunk{Seq: 0, Total: 0, Final: true}}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := criteriav2.JoinToolCallResultOutputs(tc.fragments)
+			assert.Error(t, err)
+		})
+	}
+}
+
+// TestChunkToolCallResultOutputs_OversizeContract pins the size contract of
+// the tool-call result chunking path, mirroring the ExecuteResult chunk
+// tests: outputs over the negotiated limit are detected by NeedsChunking and
+// split into fragments that each fit the limit and reassemble to the
+// original payload; outputs at the limit stay a single final chunk; and a
+// receiver handed an oversize declared total (more chunks declared than
+// delivered) fails reassembly instead of waiting for chunks that never
+// arrive or returning truncated data.
+func TestChunkToolCallResultOutputs_OversizeContract(t *testing.T) {
+	const negotiatedMax = uint32(32)
+	base := &criteriav2.ToolCallResult{RequestId: "call-1", Outcome: "success"}
+
+	t.Run("oversize outputs split into fragments within the limit", func(t *testing.T) {
+		outputs := bytes.Repeat([]byte("a"), int(negotiatedMax)+1) // one byte over
+		require.True(t, criteriav2.NeedsChunking(outputs, negotiatedMax),
+			"outputs over the negotiated limit must require chunking")
+
+		fragments := criteriav2.ChunkToolCallResultOutputs(base, outputs, negotiatedMax)
+		require.Len(t, fragments, 2, "one byte over the limit must split into two fragments")
+		for i, frag := range fragments {
+			require.NotNilf(t, frag.Chunk, "fragment[%d] must carry framing", i)
+			assert.LessOrEqualf(t, len(frag.OutputsJson), int(negotiatedMax),
+				"fragment[%d] payload must fit the negotiated limit", i)
+			assert.Equalf(t, uint32(i), frag.Chunk.Seq, "fragment[%d] seq", i)
+			assert.Equalf(t, uint32(len(fragments)), frag.Chunk.Total, "fragment[%d] total", i)
+			assert.Equalf(t, i == len(fragments)-1, frag.Chunk.Final, "fragment[%d] final flag", i)
+			assert.Equalf(t, base.RequestId, frag.RequestId, "fragment[%d] request_id", i)
+		}
+
+		joined, err := criteriav2.JoinToolCallResultOutputs(fragments)
+		require.NoError(t, err)
+		assert.Equal(t, outputs, joined, "reassembly must reproduce the oversize outputs")
+	})
+
+	t.Run("outputs at the negotiated limit stay one final chunk", func(t *testing.T) {
+		outputs := bytes.Repeat([]byte("b"), int(negotiatedMax))
+		assert.False(t, criteriav2.NeedsChunking(outputs, negotiatedMax),
+			"outputs at the negotiated limit must not require chunking")
+
+		fragments := criteriav2.ChunkToolCallResultOutputs(base, outputs, negotiatedMax)
+		require.Len(t, fragments, 1)
+		assert.True(t, fragments[0].Chunk.Final)
+		assert.Equal(t, uint32(1), fragments[0].Chunk.Total)
+
+		joined, err := criteriav2.JoinToolCallResultOutputs(fragments)
+		require.NoError(t, err)
+		assert.Equal(t, outputs, joined)
+	})
+
+	t.Run("oversize declared total fails reassembly", func(t *testing.T) {
+		// Three chunks declared, two delivered: the receiver must fail
+		// reassembly instead of waiting for the missing chunk or returning
+		// truncated outputs.
+		fragments := []*criteriav2.ToolCallResult{
+			{RequestId: base.RequestId, Outcome: base.Outcome,
+				Chunk: &criteriav2.Chunk{Seq: 0, Total: 3, Final: false}, OutputsJson: []byte("aa")},
+			{RequestId: base.RequestId, Outcome: base.Outcome,
+				Chunk: &criteriav2.Chunk{Seq: 1, Total: 3, Final: true}, OutputsJson: []byte("b")},
+		}
+		_, err := criteriav2.JoinToolCallResultOutputs(fragments)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "declares total 3 chunks but 2 were given")
+	})
+}
+
 // sliceChunkSink is a test-only ChunkSink that captures envelopes.
 type sliceChunkSink struct {
 	envelopes []*criteriav2.ChunkEnvelope

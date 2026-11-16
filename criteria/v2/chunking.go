@@ -3,6 +3,7 @@ package criteriav2
 import (
 	"errors"
 	"fmt"
+	"sort"
 )
 
 const (
@@ -42,7 +43,8 @@ func NegotiateChunkSize(adapterMax, hostMax uint32) uint32 {
 // preserve encoding invariants (e.g. codepoint-aligned UTF-8) must do so
 // before calling this function.  For the three officially chunkable fields in
 // this package, all splitting goes through the high-level helpers:
-// ChunkAdapterEventPayload, ChunkExecuteResultOutputs, and ChunkLogEventLine.
+// ChunkAdapterEventPayload, ChunkExecuteResultOutputs, ChunkLogEventLine, and
+// ChunkToolCallResultOutputs.
 // Those helpers are the only officially supported callers of SplitChunks.
 //
 // If len(data) == 0 a single empty chunk is returned.
@@ -294,6 +296,102 @@ func JoinExecuteResultOutputs(events []*ExecuteResult) ([]byte, error) {
 			return nil, fmt.Errorf("ExecuteResult fragment[%d] has no Chunk metadata", i)
 		}
 		buf = append(buf, ev.OutputsJson...)
+	}
+	return buf, nil
+}
+
+// ChunkToolCallResultOutputs splits outputsJSON into fragment ToolCallResult
+// messages derived from base (request_id, outcome, and call_error are
+// preserved).  Each fragment has chunk set and outputs_json set to the
+// fragment bytes.  chunkSize == 0 uses DefaultMaxChunkBytes.
+//
+// Chunked outputs only occur on success (call_error empty); the helper
+// preserves base's fields verbatim so callers can chunk either shape.
+func ChunkToolCallResultOutputs(base *ToolCallResult, outputsJSON []byte, chunkSize uint32) []*ToolCallResult {
+	chunks, payloads := SplitChunks(outputsJSON, chunkSize)
+	result := make([]*ToolCallResult, len(chunks))
+	for i, c := range chunks {
+		result[i] = &ToolCallResult{
+			RequestId:   base.RequestId,
+			Outcome:     base.Outcome,
+			Chunk:       c,
+			OutputsJson: payloads[i],
+			CallError:   base.CallError,
+		}
+	}
+	return result
+}
+
+// JoinToolCallResultOutputs reassembles outputs_json bytes from a sequence of
+// ToolCallResult fragment messages belonging to ONE tool call and returns the
+// concatenated JSON bytes.  The caller is responsible for unmarshalling the
+// result.
+//
+// The Permissions bidi stream may interleave fragments of concurrent tool
+// calls and deliveries, so callers must first select the fragments whose
+// RequestId matches the correlated permission.request payload (filtering is
+// the SDK's correlation step); the joiner then sorts by Chunk.Seq and joins.
+// It validates that every fragment carries Chunk metadata and a single
+// non-empty RequestId, that seq values form a contiguous run from 0, that
+// every fragment reports the same total, and that exactly one final chunk
+// exists (at seq total-1).
+//
+// Returns an error if any message lacks Chunk metadata, the fragments mix
+// request ids, or the framing is inconsistent.
+func JoinToolCallResultOutputs(events []*ToolCallResult) ([]byte, error) {
+	if len(events) == 0 {
+		return nil, errors.New("no ToolCallResult fragments to join")
+	}
+
+	requestID := events[0].RequestId
+	if requestID == "" {
+		return nil, errors.New("ToolCallResult fragments must carry a request_id")
+	}
+	for i, res := range events {
+		if res.RequestId != requestID {
+			return nil, fmt.Errorf("ToolCallResult fragment[%d] mixes request ids: got %q, expected %q", i, res.RequestId, requestID)
+		}
+	}
+
+	sorted := make([]*ToolCallResult, len(events))
+	copy(sorted, events)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Chunk.GetSeq() < sorted[j].Chunk.GetSeq()
+	})
+
+	var total uint32
+	for i, res := range sorted {
+		if res.Chunk == nil {
+			return nil, fmt.Errorf("ToolCallResult fragment[%d] has no Chunk metadata", i)
+		}
+		if i == 0 {
+			total = res.Chunk.GetTotal()
+			if total == 0 {
+				return nil, fmt.Errorf("ToolCallResult fragment[0] declares total 0")
+			}
+			if total != uint32(len(sorted)) {
+				return nil, fmt.Errorf("ToolCallResult declares total %d chunks but %d were given", total, len(sorted))
+			}
+		} else if res.Chunk.GetTotal() != total {
+			return nil, fmt.Errorf("ToolCallResult fragment[%d] declares total %d, expected %d", i, res.Chunk.GetTotal(), total)
+		}
+		if res.Chunk.GetSeq() != uint32(i) {
+			return nil, fmt.Errorf("ToolCallResult chunk seq gap: got seq %d, expected %d", res.Chunk.GetSeq(), i)
+		}
+	}
+
+	if !sorted[total-1].Chunk.GetFinal() {
+		return nil, fmt.Errorf("ToolCallResult final chunk (seq %d) missing final flag", total-1)
+	}
+	for i, res := range sorted[:total-1] {
+		if res.Chunk.GetFinal() {
+			return nil, fmt.Errorf("ToolCallResult fragment[%d] (seq %d) sets final flag early", i, res.Chunk.GetSeq())
+		}
+	}
+
+	var buf []byte
+	for _, res := range sorted {
+		buf = append(buf, res.OutputsJson...)
 	}
 	return buf, nil
 }

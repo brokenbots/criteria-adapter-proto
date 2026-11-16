@@ -1,0 +1,40 @@
+{
+  "name": "schema-invalid payload rejected with ordered issue list",
+  "phases": [
+    {
+      "expect": {
+        "accepted": false,
+        "issues": [
+          "payload_schema: property \"summary\": expected \"string\", got \"number\"",
+          "payload_schema: property \"exit_code\": expected \"number\", got \"string\""
+        ],
+        "rejection": {
+          "attempt": 1,
+          "issues": "payload_schema: property \"summary\": expected \"string\", got \"number\"\npayload_schema: property \"exit_code\": expected \"number\", got \"string\"",
+          "outcome": "completed"
+        }
+      },
+      "request": {
+        "allowedOutcomes": [
+          "completed",
+          "failed"
+        ],
+        "outcomeContracts": [
+          {
+            "name": "completed",
+            "schemaJson": "eyJ0eXBlIjoib2JqZWN0IiwicmVxdWlyZWQiOlsic3VtbWFyeSIsImV4aXRfY29kZSJdLCJwcm9wZXJ0aWVzIjp7InN1bW1hcnkiOnsidHlwZSI6InN0cmluZyJ9LCJleGl0X2NvZGUiOnsidHlwZSI6Im51bWJlciJ9fX0="
+          }
+        ],
+        "sessionId": "sess-conformance",
+        "stepName": "summarize"
+      },
+      "results": [
+        {
+          "comment": "done",
+          "outcome": "completed",
+          "outputsJson": "eyJzdW1tYXJ5Ijo0MiwiZXhpdF9jb2RlIjoiemVybyJ9"
+        }
+      ]
+    }
+  ]
+}
